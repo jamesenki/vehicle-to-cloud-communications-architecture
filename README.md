@@ -28,8 +28,28 @@ Documentation of recommended basic practices for MQTT V5 based vehicle to cloud 
 * Middleware API set for translation from ISO Standards to VSS
  
 
-## General Architecture 
-![Drawing](src/main/doc/images/C4_Project_Architecture.png)
+## General Architecture
+![C4 Project Architecture](src/main/doc/images/C4_Project_Architecture.png)
+
+## Documentation
+
+### 📘 Core References
+- [API and Protocol Reference](docs/API_AND_PROTOCOL_REFERENCE.md) - Complete MQTT topics and Protocol Buffer specifications
+- [Architecture Review](ARCHITECTURE_REVIEW.md) - System architecture and design decisions
+
+### 🔒 Security & Compliance
+- [ISO 21434 TARA](docs/security/ISO_21434_TARA.md) - Threat Analysis and Risk Assessment
+- [PII Data Governance](docs/security/PII_DATA_GOVERNANCE.md) - Personal data handling policies
+- [Certificate Lifecycle](docs/security/CERTIFICATE_LIFECYCLE.md) - PKI and certificate management
+- [Audit Logging](docs/security/AUDIT_LOGGING.md) - Security event logging
+
+### 🛠️ Implementation Guides
+- [Topic Naming Convention](docs/standards/TOPIC_NAMING_CONVENTION.md) - MQTT topic structure standards
+- [QoS Selection Guide](docs/standards/QOS_SELECTION_GUIDE.md) - Quality of Service level selection
+- [Topic Aliases](docs/implementation/TOPIC_ALIASES.md) - Bandwidth optimization with aliases
+
+### 🔍 Failure Mode Analysis
+- [FMEA: Remote Door Lock](docs/fmea/FMEA_REMOTE_DOOR_LOCK.md) - Comprehensive failure mode analysis for remote door locking
 
 ## Potential Use Cases
 * Vehicle and Vehicle Device Provisioning
@@ -114,7 +134,7 @@ It is not the scope of this project to classify data objects in terms of PII, bu
 ### MQTT Publish and Subscribe Lifecycle
 The diagram below shows the basic Connection, Subscription and Messsage publishing lifecycle for MQTT Messages in a Connected Vehicle System. More complex orchestrations are required for particular patterns and will be detailed in the documentation for each pattern. 
 
-![SimpleMessageOrchestration](src/main/doc/images/Lifecycle.png)
+![MQTT Message Lifecycle](src/main/doc/images/Lifecycle.png)
 
 
 #### The Importance of State
@@ -132,7 +152,7 @@ Some messages are time sensitive in nature and must be delivered immediately in 
 
 We would see these messages treated very differently, in particular sincec the most common pattern for prompting a disconnected vehicle to connect to the MQTT broker is by sending an SMS message, which is costly. In fact for anyone being cost conscious about data transfer, the waking of the vehicle and establishing of the mTLS connection carries its own cost at approximatley 4.5K if the TCP network connection has already been disconnected.
 
-![ComplexMessageOrchestration](src/main/doc/images/HighandLow.png)
+![High Priority vs Low Priority Message Handling](src/main/doc/images/HighandLow.png)
 
 ### Message IDs
 For both system and operations purposes message id's are important for MQTT communications, for the most part these are system provided in MQTT5 and help support both QOS and request/response activites. The message identifier types provided by MQTT 5 include: 
