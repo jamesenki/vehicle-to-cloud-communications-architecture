@@ -1,0 +1,625 @@
+syntax = "proto3";
+
+package com.vehicle.v2c.commands.v1;
+
+import "Common.proto";
+
+// # Remote Vehicle Command Protocol
+//
+// This file defines the complete remote command protocol for sending
+// actionable commands from cloud to vehicle. The protocol supports:
+// - Idempotency for reliable command execution
+// - State validation before command execution
+// - Progress tracking and status reporting
+// - Timeout and cancellation support
+// - Security audit trail for all commands
+//
+// ## Security Requirements
+// - All commands MUST be authenticated with valid JWT token
+// - Commands MUST be logged to audit trail with user attribution
+// - Vehicle MUST validate command safety before execution
+// - Critical commands (remote start) require additional authorization
+// - Rate limiting: max 10 commands per vehicle per minute
+//
+// ## MQTT Topics
+// - Cloud → Vehicle: v2c/v1/{region}/{vehicle_id}/command/request
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/command/response
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/command/status
+//
+// ## QoS Recommendations
+// - Door lock/unlock: QoS 1 (at least once)
+// - Climate control: QoS 1
+// - Remote start: QoS 2 (exactly once, safety-critical)
+// - Horn/lights: QoS 1
+// - Charge control: QoS 2 (prevent battery damage)
+//
+
+// ===== Remote Command Request =====
+
+// Cloud sends command to vehicle
+message RemoteCommandRequest {
+  // Unique command identifier (UUID)
+  // Used for idempotency - duplicate commands with same ID are ignored
+  string command_id = 1;
+
+  // User who initiated the command
+  string user_id = 2;
+
+  // Command type and parameters (only one will be set)
+  oneof command {
+    LockDoorsCommand lock_doors = 10;
+    UnlockDoorsCommand unlock_doors = 11;
+    StartClimateCommand start_climate = 12;
+    StopClimateCommand stop_climate = 13;
+    HornLightsCommand horn_lights = 14;
+    RemoteStartCommand remote_start = 15;
+    ChargeControlCommand charge_control = 16;
+    ValetModeCommand valet_mode = 17;
+    TrunkReleaseCommand trunk_release = 18;
+    WindowControlCommand window_control = 19;
+  }
+
+  // Command priority
+  CommandPriority priority = 20;
+
+  // Maximum time to wait for execution (seconds)
+  // Command expires if not executed within this time
+  int32 timeout_seconds = 21;
+
+  // Command expiry timestamp (EPOCH milliseconds)
+  // After this time, command should not be executed
+  int64 expires_at = 22;
+
+  // Authorization token for critical commands
+  // Required for remote_start, trunk_release
+  string authorization_token = 23;
+
+  // Metadata for tracking
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 24;
+}
+
+enum CommandPriority {
+  PRIORITY_UNKNOWN = 0;
+
+  // Normal user-initiated command
+  NORMAL = 1;
+
+  // High priority (emergency assistance)
+  HIGH = 2;
+
+  // Critical (stolen vehicle recovery)
+  CRITICAL = 3;
+}
+
+// ===== Command Types =====
+
+// Lock all vehicle doors
+message LockDoorsCommand {
+  // Lock all doors including trunk
+  bool lock_trunk = 1;
+
+  // Enable alarm system after locking
+  bool enable_alarm = 2;
+
+  // Flash lights to confirm lock
+  bool flash_lights = 3;
+
+  // Honk horn to confirm lock
+  bool honk_horn = 4;
+}
+
+// Unlock vehicle doors
+message UnlockDoorsCommand {
+  // Which doors to unlock
+  DoorSelection door_selection = 1;
+
+  // Disable alarm system after unlocking
+  bool disable_alarm = 2;
+
+  // Flash lights to confirm unlock
+  bool flash_lights = 3;
+
+  // Auto re-lock if no door opened within timeout
+  bool auto_relock = 4;
+
+  // Auto re-lock timeout (seconds, default 30)
+  int32 auto_relock_timeout_sec = 5;
+}
+
+enum DoorSelection {
+  DOOR_SELECTION_UNKNOWN = 0;
+
+  // Unlock all doors
+  ALL_DOORS = 1;
+
+  // Unlock driver door only
+  DRIVER_ONLY = 2;
+
+  // Unlock driver and front passenger
+  FRONT_ONLY = 3;
+
+  // Unlock specific door
+  SPECIFIC_DOOR = 4;
+}
+
+// Start climate control system
+message StartClimateCommand {
+  // Target cabin temperature (Celsius)
+  // Range: 15-30°C
+  float target_temperature_celsius = 1;
+
+  // Climate mode
+  ClimateMode mode = 2;
+
+  // Fan speed (0-7, 0=auto)
+  int32 fan_speed = 3;
+
+  // Enable seat heater
+  bool seat_heater_enabled = 4;
+
+  // Seat heater level (1-3)
+  int32 seat_heater_level = 5;
+
+  // Enable steering wheel heater
+  bool steering_wheel_heater_enabled = 6;
+
+  // Auto shut-off time (minutes, max 30)
+  int32 auto_shutoff_minutes = 7;
+
+  // Recirculation mode
+  bool recirculation_enabled = 8;
+}
+
+enum ClimateMode {
+  CLIMATE_MODE_UNKNOWN = 0;
+  AUTO = 1;
+  COOL = 2;
+  HEAT = 3;
+  DEFROST = 4;
+  VENTILATE = 5;
+}
+
+// Stop climate control system
+message StopClimateCommand {
+  // Turn off seat heaters
+  bool disable_seat_heaters = 1;
+
+  // Turn off steering wheel heater
+  bool disable_steering_wheel_heater = 2;
+}
+
+// Activate horn and/or lights
+message HornLightsCommand {
+  // Horn pattern
+  HornPattern horn_pattern = 1;
+
+  // Light pattern
+  LightPattern light_pattern = 2;
+
+  // Duration (seconds, max 30)
+  int32 duration_seconds = 3;
+
+  // Number of repetitions (max 10)
+  int32 repetitions = 4;
+}
+
+enum HornPattern {
+  HORN_PATTERN_UNKNOWN = 0;
+  HORN_OFF = 1;
+  HORN_SINGLE_SHORT = 2;
+  HORN_DOUBLE_SHORT = 3;
+  HORN_CONTINUOUS = 4;
+}
+
+enum LightPattern {
+  LIGHT_PATTERN_UNKNOWN = 0;
+  LIGHTS_OFF = 1;
+  LIGHTS_FLASH_ONCE = 2;
+  LIGHTS_FLASH_CONTINUOUS = 3;
+  HAZARDS_ON = 4;
+}
+
+// Remote engine/motor start
+message RemoteStartCommand {
+  // Climate control settings (optional)
+  StartClimateCommand climate_settings = 1;
+
+  // Auto shut-off time (minutes, max 30)
+  int32 auto_shutoff_minutes = 2;
+
+  // For EVs: enable battery preconditioning
+  bool battery_preconditioning_enabled = 3;
+
+  // PIN code for additional security (if configured)
+  string pin_code = 4;
+}
+
+// Control vehicle charging (EVs only)
+message ChargeControlCommand {
+  // Charge action
+  ChargeAction action = 1;
+
+  // Target state of charge percentage (10-100)
+  int32 target_soc_percent = 2;
+
+  // Maximum charge current (Amps)
+  int32 max_charge_current_amps = 3;
+
+  // Scheduled departure time (EPOCH milliseconds)
+  // Vehicle will optimize charging to complete by this time
+  int64 scheduled_departure_time = 4;
+
+  // Off-peak charging only
+  bool off_peak_only = 5;
+}
+
+enum ChargeAction {
+  CHARGE_ACTION_UNKNOWN = 0;
+
+  // Start charging immediately
+  START_CHARGE = 1;
+
+  // Stop charging
+  STOP_CHARGE = 2;
+
+  // Set scheduled charging
+  SCHEDULE_CHARGE = 3;
+
+  // Unlock charge port
+  UNLOCK_CHARGE_PORT = 4;
+}
+
+// Enable/disable valet mode
+message ValetModeCommand {
+  // Enable or disable
+  bool enable = 1;
+
+  // Speed limit (km/h) when valet mode active
+  int32 speed_limit_kmh = 2;
+
+  // Maximum range limit (km)
+  int32 range_limit_km = 3;
+
+  // Disable access to trunk
+  bool disable_trunk_access = 4;
+
+  // Disable access to glovebox
+  bool disable_glovebox_access = 5;
+
+  // PIN code to exit valet mode
+  string exit_pin_code = 6;
+}
+
+// Release trunk/frunk
+message TrunkReleaseCommand {
+  // Which compartment to open
+  CompartmentSelection compartment = 1;
+
+  // Auto close after timeout (seconds)
+  int32 auto_close_timeout_sec = 2;
+}
+
+enum CompartmentSelection {
+  COMPARTMENT_UNKNOWN = 0;
+  TRUNK = 1;
+  FRUNK = 2; // Front trunk (EVs)
+  BOTH = 3;
+}
+
+// Control windows
+message WindowControlCommand {
+  // Window action
+  WindowAction action = 1;
+
+  // Which windows to control
+  WindowSelection window_selection = 2;
+
+  // Vent mode (open slightly)
+  bool vent_mode = 3;
+}
+
+enum WindowAction {
+  WINDOW_ACTION_UNKNOWN = 0;
+  WINDOW_OPEN = 1;
+  WINDOW_CLOSE = 2;
+  WINDOW_VENT = 3;
+}
+
+enum WindowSelection {
+  WINDOW_SELECTION_UNKNOWN = 0;
+  ALL_WINDOWS = 1;
+  DRIVER_WINDOW = 2;
+  FRONT_WINDOWS = 3;
+  REAR_WINDOWS = 4;
+}
+
+// ===== Command Response =====
+
+// Vehicle acknowledges command receipt
+message RemoteCommandResponse {
+  // Command ID from request
+  string command_id = 1;
+
+  // Response status
+  ResponseStatus status = 2;
+
+  // If status = REJECTED or FAILED, reason code
+  string reason = 3;
+
+  // If status = ACCEPTED, estimated execution time
+  int32 estimated_execution_seconds = 4;
+
+  // Current vehicle state at time of command
+  VehicleCommandState vehicle_state = 5;
+
+  // If status = FAILED, detailed error
+  com.vehicle.v2c.common.v1.V2CError error = 6;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 7;
+}
+
+enum ResponseStatus {
+  RESPONSE_STATUS_UNKNOWN = 0;
+
+  // Command accepted, will execute
+  ACCEPTED = 1;
+
+  // Command rejected due to preconditions
+  REJECTED = 2;
+
+  // Command execution failed
+  FAILED = 3;
+
+  // Command completed successfully
+  COMPLETED = 4;
+
+  // Command already in progress (duplicate)
+  DUPLICATE = 5;
+
+  // Command expired before execution
+  EXPIRED = 6;
+
+  // Command cancelled
+  CANCELLED = 7;
+}
+
+// Vehicle state relevant for command validation
+message VehicleCommandState {
+  // Vehicle speed (km/h)
+  float speed_kmh = 1;
+
+  // Ignition state
+  bool ignition_on = 2;
+
+  // Any door is open
+  bool doors_open = 3;
+
+  // Vehicle is locked
+  bool locked = 4;
+
+  // Battery/fuel level (percentage)
+  int32 battery_level = 5;
+
+  // Parking brake engaged
+  bool parking_brake_engaged = 6;
+
+  // Gear position
+  GearPosition gear_position = 7;
+
+  // Charging status (EVs)
+  bool charging = 8;
+
+  // Charge port connected (EVs)
+  bool charge_port_connected = 9;
+}
+
+enum GearPosition {
+  GEAR_UNKNOWN = 0;
+  PARK = 1;
+  REVERSE = 2;
+  NEUTRAL = 3;
+  DRIVE = 4;
+}
+
+// ===== Command Status Updates =====
+
+// Vehicle reports command execution status
+message RemoteCommandStatus {
+  // Command ID
+  string command_id = 1;
+
+  // Execution status
+  ExecutionStatus status = 2;
+
+  // Progress percentage (0-100)
+  int32 progress_percent = 3;
+
+  // Status description
+  string status_message = 4;
+
+  // If status = FAILED, error details
+  com.vehicle.v2c.common.v1.V2CError error = 5;
+
+  // Command completion timestamp (if completed)
+  int64 completed_at = 6;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 7;
+}
+
+enum ExecutionStatus {
+  EXECUTION_STATUS_UNKNOWN = 0;
+
+  // Command queued for execution
+  QUEUED = 1;
+
+  // Command executing
+  IN_PROGRESS = 2;
+
+  // Command completed successfully
+  COMPLETED = 3;
+
+  // Command failed during execution
+  FAILED = 4;
+
+  // Command cancelled by user or system
+  CANCELLED = 5;
+
+  // Command timed out
+  TIMED_OUT = 6;
+}
+
+// ===== Command Validation =====
+
+// Preconditions for command execution
+// These are checked by vehicle before executing command
+message CommandPreconditions {
+  // Maximum vehicle speed allowed (km/h)
+  float max_speed_kmh = 1;
+
+  // Minimum battery/fuel level required (percentage)
+  int32 min_battery_level = 2;
+
+  // Ignition must be off
+  bool requires_ignition_off = 3;
+
+  // Vehicle must be in PARK
+  bool requires_park_gear = 4;
+
+  // All doors must be closed
+  bool requires_doors_closed = 5;
+
+  // Parking brake must be engaged
+  bool requires_parking_brake = 6;
+
+  // Additional authorization required
+  bool requires_authorization_token = 7;
+
+  // PIN code required
+  bool requires_pin_code = 8;
+}
+
+// Command-specific precondition mappings (documented for reference)
+//
+// LockDoorsCommand:
+//   - No preconditions (can lock at any time)
+//
+// UnlockDoorsCommand:
+//   - max_speed_kmh: 5 (vehicle must be stationary or slow)
+//
+// StartClimateCommand:
+//   - min_battery_level: 20 (prevent battery drain)
+//   - requires_ignition_off: true (or already running)
+//
+// RemoteStartCommand:
+//   - requires_park_gear: true
+//   - requires_doors_closed: true
+//   - min_battery_level: 30
+//   - requires_authorization_token: true (high-value vehicles)
+//   - requires_pin_code: true (if configured)
+//
+// ChargeControlCommand (START_CHARGE):
+//   - requires_park_gear: true
+//   - requires_charge_port_connected: true
+//
+// TrunkReleaseCommand:
+//   - max_speed_kmh: 5
+//   - requires_authorization_token: true
+//
+// WindowControlCommand (CLOSE):
+//   - max_speed_kmh: 100 (can close at highway speed for safety)
+//
+// WindowControlCommand (OPEN):
+//   - No preconditions
+//
+
+// ===== Command History =====
+
+// Query command history
+message CommandHistoryRequest {
+  // Filter by time range
+  int64 start_time = 1;
+  int64 end_time = 2;
+
+  // Filter by command type
+  repeated string command_types = 3;
+
+  // Filter by status
+  repeated ExecutionStatus statuses = 4;
+
+  // Maximum number of records to return
+  int32 limit = 5;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 6;
+}
+
+message CommandHistoryResponse {
+  // Historical commands
+  repeated CommandHistoryEntry commands = 1;
+
+  // Total count (may be more than returned if limit applied)
+  int32 total_count = 2;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 3;
+}
+
+message CommandHistoryEntry {
+  // Command ID
+  string command_id = 1;
+
+  // Command type
+  string command_type = 2;
+
+  // User who initiated
+  string user_id = 3;
+
+  // Timestamp when command was sent
+  int64 sent_at = 4;
+
+  // Timestamp when command was executed
+  int64 executed_at = 5;
+
+  // Final status
+  ExecutionStatus status = 6;
+
+  // Execution duration (seconds)
+  int32 duration_seconds = 7;
+
+  // Error message if failed
+  string error_message = 8;
+}
+
+// ===== Rate Limiting =====
+
+// Cloud checks rate limits before sending command
+message RateLimitInfo {
+  // Commands sent in current window
+  int32 commands_sent = 1;
+
+  // Maximum commands allowed per window
+  int32 max_commands = 2;
+
+  // Window duration (seconds)
+  int32 window_seconds = 3;
+
+  // Time until window resets (seconds)
+  int32 reset_in_seconds = 4;
+}
+
+// Rate limit exceeded response
+message RateLimitExceeded {
+  // When rate limit will reset
+  int64 reset_at = 1;
+
+  // Retry after (seconds)
+  int32 retry_after_seconds = 2;
+
+  // Current rate limit info
+  RateLimitInfo rate_limit_info = 3;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 4;
+}

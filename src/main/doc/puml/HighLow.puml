@@ -1,0 +1,80 @@
+
+
+@startuml "High and Low Prioty Messages"
+
+
+participant "Vehicle Application" as application
+participant "Vehicle Edge MQTT Client" as client
+participant "MQTT Broker" as broker
+participant "Vehicle State Service" as vehstat 
+participant "Connected Vehicle Compute" as cvc
+boundary "Incoming Event/Request" as pub
+
+note left of application: This flow assumes \n the previous security \nlifecycle has been\n completed and TLS TCP \n connection established
+
+client -> broker: Connect
+broker -> broker: Authorization check
+broker -> client: ConnectAck
+broker -> vehstat: <client_id> Connected
+application -> broker: Subscribe <topic_id>
+broker -> application: SUBACK
+broker -> vehstat: <client_id> Subscribed to <topic_id>
+
+pub -> cvc: Message/Request for Vehicle
+cvc -> cvc: Create Message
+cvc -> vehstat: isVehicleSubscribed to <topic_id>
+== More Complex Orchestration ==
+alt Vehicle Not Connected and Subscribed
+vehstat -> cvc: isVehicleSubscribedResponse (Not Subscribed)
+alt High Priority Messages Success 
+note right of cvc: High Priotity messages are messages\n that are urgent have an\n execution requirement that requires a low latency.\n i.e. Remote Door Unlock.
+create SMS  
+cvc -> SMS: Send vehicle "Shoulder tap"
+SMS -> client: Wake up Message
+client -> broker: Connect
+broker -> broker: Authorization check
+broker -> client: ConnectAck
+broker -> vehstat: <client_id> Connected
+application -> broker: Subscribe <topic_id>
+broker -> application: SUBACK
+broker -> vehstat: <client_id> Subscribed to <topic_id>
+vehstat -> cvc: Client is now Connected and Subscribed
+
+else Shoulder Tap Fails
+cvc -> cvc: Timeout passed
+cvc -> pub: Response "ERROR: Vehicle Not Reachable" 
+end  
+alt Low Priority  
+create localMessageStore
+cvc -> localMessageStore: Store Message with long TTL
+cvc -> vehstat: postNotifyRequest
+note left of cvc: <&timer> passes less than ttl
+client -> broker: Connect
+broker -> broker: Authorization check
+broker -> client: ConnectAck
+broker -> vehstat: <client_id> Connected
+application -> broker: Subscribe <topic_id>
+broker -> application: SUBACK
+broker -> vehstat: <client_id> Subscribed to <topic_id>
+else Cient Does not Connect Before TTL  
+cvc -> pub: Vehicle did not connect before timeout
+end
+cvc -> broker: Publish to <topic_id> 
+broker -> cvc: PUBACK
+broker <-> application: message received
+application -> broker: ACK (QoS dependent)
+applicaiton -> application: deserialize and take action
+application -> application: create response message
+application -> broker: Pubish Response to <response_topic_id>
+broker -> cvc: Response Message
+cvc -> pub: Response Message
+end  
+
+
+
+
+
+
+
+
+@enduml

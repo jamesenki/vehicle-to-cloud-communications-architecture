@@ -1,0 +1,763 @@
+syntax = "proto3";
+
+package com.vehicle.v2c.diagnostics.v1;
+
+import "Common.proto";
+import "Telemetry.proto";
+
+// # Vehicle Diagnostics Collection Protocol
+//
+// This file defines the protocol for collecting and reporting comprehensive
+// vehicle diagnostic data including DTCs, ECU health, snapshots, and logs.
+//
+// ## Use Cases
+// - Remote diagnostics and troubleshooting
+// - Predictive maintenance (detect issues before failure)
+// - Fleet health monitoring
+// - Warranty claim validation
+// - Engineering analysis (field data collection)
+// - Customer support assistance
+//
+// ## MQTT Topics
+// - Cloud → Vehicle: v2c/v1/{region}/{vehicle_id}/diagnostics/request
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/diagnostics/dtc
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/diagnostics/snapshot
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/diagnostics/logs
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/diagnostics/health
+//
+// ## QoS Recommendations
+// - DTC reports: QoS 1 (important for maintenance)
+// - Snapshots: QoS 1
+// - Log uploads: QoS 1
+// - Health reports: QoS 1
+//
+
+// ===== Diagnostic Trouble Codes (DTCs) =====
+
+// Vehicle reports active or stored DTCs
+message DTCReport {
+  // Report identifier
+  string report_id = 1;
+
+  // Report timestamp
+  int64 timestamp = 2;
+
+  // Report type
+  DTCReportType report_type = 3;
+
+  // Diagnostic trouble codes
+  repeated DiagnosticTroubleCode dtcs = 4;
+
+  // Total DTC count
+  int32 total_dtc_count = 5;
+
+  // ECU that generated this report
+  string source_ecu = 6;
+
+  // Vehicle mileage when report generated (km)
+  int64 mileage_km = 7;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 8;
+}
+
+enum DTCReportType {
+  DTC_REPORT_TYPE_UNKNOWN = 0;
+
+  // Currently active DTCs
+  ACTIVE_DTCS = 1;
+
+  // Stored/historical DTCs
+  STORED_DTCS = 2;
+
+  // Pending DTCs (detected but not confirmed)
+  PENDING_DTCS = 3;
+
+  // Permanent DTCs (emissions-related)
+  PERMANENT_DTCS = 4;
+
+  // All DTCs
+  ALL_DTCS = 5;
+}
+
+// Individual DTC details
+message DiagnosticTroubleCode {
+  // DTC code (e.g., "P0171", "C0035")
+  string code = 1;
+
+  // DTC description
+  string description = 2;
+
+  // DTC severity
+  DTCSeverity severity = 3;
+
+  // DTC category
+  DTCCategory category = 4;
+
+  // DTC status
+  DTCStatus status = 5;
+
+  // When DTC first occurred
+  int64 first_occurrence = 6;
+
+  // When DTC last occurred
+  int64 last_occurrence = 7;
+
+  // Number of occurrences
+  int32 occurrence_count = 8;
+
+  // Freeze frame data (snapshot when DTC set)
+  FreezeFrame freeze_frame = 9;
+
+  // Affected system/component
+  string affected_system = 10;
+
+  // Recommended action
+  string recommended_action = 11;
+
+  // Mileage when DTC first set (km)
+  int64 mileage_at_first_occurrence_km = 12;
+
+  // Mileage when DTC last occurred (km)
+  int64 mileage_at_last_occurrence_km = 13;
+}
+
+enum DTCSeverity {
+  DTC_SEVERITY_UNKNOWN = 0;
+
+  // Informational only, no action required
+  INFO = 1;
+
+  // Minor issue, service recommended
+  LOW = 2;
+
+  // Moderate issue, service soon
+  MEDIUM = 3;
+
+  // Serious issue, service immediately
+  HIGH = 4;
+
+  // Critical issue, do not drive
+  CRITICAL = 5;
+}
+
+enum DTCCategory {
+  DTC_CATEGORY_UNKNOWN = 0;
+
+  // Powertrain (P-codes)
+  POWERTRAIN = 1;
+
+  // Chassis (C-codes)
+  CHASSIS = 2;
+
+  // Body (B-codes)
+  BODY = 3;
+
+  // Network/Communication (U-codes)
+  NETWORK = 4;
+
+  // Manufacturer-specific
+  MANUFACTURER = 5;
+}
+
+enum DTCStatus {
+  DTC_STATUS_UNKNOWN = 0;
+
+  // Currently active
+  ACTIVE = 1;
+
+  // Stored (occurred in past, not active)
+  STORED = 2;
+
+  // Pending (detected but not confirmed)
+  PENDING = 3;
+
+  // Permanent (emissions-related, cannot be cleared)
+  PERMANENT = 4;
+
+  // Cleared by technician
+  CLEARED = 5;
+}
+
+// Freeze frame captures vehicle state when DTC set
+message FreezeFrame {
+  // Freeze frame ID
+  int32 frame_id = 1;
+
+  // Timestamp when freeze frame captured
+  int64 timestamp = 2;
+
+  // Engine RPM
+  int32 engine_rpm = 3;
+
+  // Vehicle speed (km/h)
+  float speed_kmh = 4;
+
+  // Engine coolant temperature (Celsius)
+  float coolant_temp_celsius = 5;
+
+  // Intake air temperature (Celsius)
+  float intake_air_temp_celsius = 6;
+
+  // Throttle position (percentage)
+  float throttle_position_percent = 7;
+
+  // Engine load (percentage)
+  float engine_load_percent = 8;
+
+  // Fuel trim short term (percentage)
+  float fuel_trim_short_percent = 9;
+
+  // Fuel trim long term (percentage)
+  float fuel_trim_long_percent = 10;
+
+  // Intake manifold pressure (kPa)
+  float manifold_pressure_kpa = 11;
+
+  // Battery voltage (V)
+  float battery_voltage = 12;
+
+  // Fuel level (percentage)
+  float fuel_level_percent = 13;
+
+  // Additional PIDs (Parameter IDs)
+  map<string, float> additional_pids = 14;
+}
+
+// ===== Vehicle Snapshot =====
+
+// Complete vehicle state capture
+message VehicleSnapshot {
+  // Snapshot identifier
+  string snapshot_id = 1;
+
+  // Snapshot timestamp
+  int64 timestamp = 2;
+
+  // Reason for snapshot
+  SnapshotReason reason = 3;
+
+  // Trigger (what caused snapshot)
+  string trigger = 4;
+
+  // Complete vehicle telemetry at this moment
+  com.vehicle.v2c.telemetry.v1.VehicleTelemetry telemetry = 5;
+
+  // All active DTCs
+  repeated DiagnosticTroubleCode active_dtcs = 6;
+
+  // ECU health status
+  repeated ECUHealth ecu_health = 7;
+
+  // CAN bus statistics
+  repeated CANBusStatistics can_bus_stats = 8;
+
+  // Battery health
+  BatteryHealth battery_health = 9;
+
+  // Tire pressure monitoring
+  TirePressureMonitoring tpms = 10;
+
+  // Fluid levels
+  FluidLevels fluid_levels = 11;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 12;
+}
+
+enum SnapshotReason {
+  SNAPSHOT_REASON_UNKNOWN = 0;
+
+  // Manual request from cloud
+  MANUAL_REQUEST = 1;
+
+  // Triggered by DTC
+  DTC_TRIGGERED = 2;
+
+  // Triggered by crash/collision
+  CRASH_DETECTED = 3;
+
+  // Scheduled periodic snapshot
+  PERIODIC = 4;
+
+  // Triggered by abnormal behavior
+  ANOMALY_DETECTED = 5;
+
+  // Before/after OTA update
+  OTA_UPDATE = 6;
+
+  // Customer support request
+  SUPPORT_REQUEST = 7;
+}
+
+// ECU health information
+message ECUHealth {
+  // ECU identifier
+  string ecu_id = 1;
+
+  // ECU name/description
+  string ecu_name = 2;
+
+  // Health status
+  HealthStatus health_status = 3;
+
+  // CPU utilization (percentage)
+  float cpu_utilization_percent = 4;
+
+  // Memory utilization (percentage)
+  float memory_utilization_percent = 5;
+
+  // Temperature (Celsius)
+  float temperature_celsius = 6;
+
+  // Voltage (V)
+  float voltage = 7;
+
+  // Boot count
+  int32 boot_count = 8;
+
+  // Uptime (seconds)
+  int64 uptime_seconds = 9;
+
+  // Error count
+  int32 error_count = 10;
+
+  // Warning count
+  int32 warning_count = 11;
+
+  // Software version
+  string software_version = 12;
+
+  // Hardware version
+  string hardware_version = 13;
+}
+
+enum HealthStatus {
+  HEALTH_STATUS_UNKNOWN = 0;
+  HEALTHY = 1;
+  DEGRADED = 2;
+  UNHEALTHY = 3;
+  OFFLINE = 4;
+}
+
+// CAN bus statistics
+message CANBusStatistics {
+  // CAN bus identifier
+  string bus_id = 1;
+
+  // Bus name
+  string bus_name = 2;
+
+  // Bus utilization (percentage)
+  float utilization_percent = 3;
+
+  // Message rate (messages/second)
+  float message_rate = 4;
+
+  // Error frames count
+  int32 error_frame_count = 5;
+
+  // Bus off count
+  int32 bus_off_count = 6;
+
+  // RX error count
+  int32 rx_error_count = 7;
+
+  // TX error count
+  int32 tx_error_count = 8;
+}
+
+// Battery health (12V and high-voltage for EVs)
+message BatteryHealth {
+  // 12V battery voltage (V)
+  float voltage_12v = 1;
+
+  // 12V battery state of charge (percentage)
+  float soc_12v_percent = 2;
+
+  // 12V battery state of health (percentage)
+  float soh_12v_percent = 3;
+
+  // 12V battery temperature (Celsius)
+  float temperature_12v_celsius = 4;
+
+  // High-voltage battery details (EVs only)
+  HighVoltageBattery hv_battery = 5;
+}
+
+message HighVoltageBattery {
+  // Pack voltage (V)
+  float pack_voltage = 1;
+
+  // Pack current (A)
+  float pack_current = 2;
+
+  // State of charge (percentage)
+  float soc_percent = 3;
+
+  // State of health (percentage)
+  float soh_percent = 4;
+
+  // Pack temperature (Celsius)
+  float pack_temperature_celsius = 5;
+
+  // Cell voltage min (V)
+  float cell_voltage_min = 6;
+
+  // Cell voltage max (V)
+  float cell_voltage_max = 7;
+
+  // Cell voltage delta (V)
+  float cell_voltage_delta = 8;
+
+  // Cell temperature min (Celsius)
+  float cell_temp_min_celsius = 9;
+
+  // Cell temperature max (Celsius)
+  float cell_temp_max_celsius = 10;
+
+  // Number of charge cycles
+  int32 charge_cycles = 11;
+
+  // Total energy throughput (kWh)
+  float total_energy_kwh = 12;
+}
+
+// Tire pressure monitoring
+message TirePressureMonitoring {
+  // Front left tire
+  TireData front_left = 1;
+
+  // Front right tire
+  TireData front_right = 2;
+
+  // Rear left tire
+  TireData rear_left = 3;
+
+  // Rear right tire
+  TireData rear_right = 4;
+
+  // Spare tire (if equipped)
+  TireData spare = 5;
+}
+
+message TireData {
+  // Tire pressure (kPa)
+  float pressure_kpa = 1;
+
+  // Tire temperature (Celsius)
+  float temperature_celsius = 2;
+
+  // Tire status
+  TireStatus status = 3;
+
+  // Pressure deviation from recommended (percentage)
+  float pressure_deviation_percent = 4;
+}
+
+enum TireStatus {
+  TIRE_STATUS_UNKNOWN = 0;
+  NORMAL = 1;
+  LOW_PRESSURE = 2;
+  HIGH_PRESSURE = 3;
+  CRITICALLY_LOW = 4;
+  SENSOR_FAULT = 5;
+}
+
+// Fluid levels
+message FluidLevels {
+  // Engine oil level (percentage)
+  float engine_oil_percent = 1;
+
+  // Engine oil quality (percentage, 100=new)
+  float engine_oil_quality_percent = 2;
+
+  // Coolant level (percentage)
+  float coolant_percent = 3;
+
+  // Brake fluid level (percentage)
+  float brake_fluid_percent = 4;
+
+  // Washer fluid level (percentage)
+  float washer_fluid_percent = 5;
+
+  // Transmission fluid level (percentage)
+  float transmission_fluid_percent = 6;
+
+  // DEF/AdBlue level (percentage, diesel vehicles)
+  float def_percent = 7;
+}
+
+// ===== Diagnostic Session =====
+
+// Cloud initiates diagnostic session
+message DiagnosticSessionRequest {
+  // Session identifier
+  string session_id = 1;
+
+  // Session type
+  SessionType session_type = 2;
+
+  // Requested diagnostics
+  repeated DiagnosticType requested_diagnostics = 3;
+
+  // Maximum session duration (seconds)
+  int32 max_duration_seconds = 4;
+
+  // Session priority
+  SessionPriority priority = 5;
+
+  // Additional parameters
+  map<string, string> parameters = 6;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 7;
+}
+
+enum SessionType {
+  SESSION_TYPE_UNKNOWN = 0;
+
+  // Read DTCs only
+  READ_DTCS = 1;
+
+  // Clear DTCs
+  CLEAR_DTCS = 2;
+
+  // Full snapshot
+  SNAPSHOT = 3;
+
+  // Continuous monitoring
+  CONTINUOUS_MONITORING = 4;
+
+  // Log upload
+  LOG_UPLOAD = 5;
+
+  // ECU health check
+  ECU_HEALTH = 6;
+
+  // Comprehensive (all of above)
+  COMPREHENSIVE = 7;
+}
+
+enum DiagnosticType {
+  DIAGNOSTIC_TYPE_UNKNOWN = 0;
+  DTCS = 1;
+  FREEZE_FRAMES = 2;
+  ECU_HEALTH = 3;
+  CAN_BUS_STATS = 4;
+  BATTERY_HEALTH = 5;
+  TPMS = 6;
+  FLUID_LEVELS = 7;
+  SENSOR_DATA = 8;
+  ACTUATOR_TESTS = 9;
+}
+
+enum SessionPriority {
+  SESSION_PRIORITY_UNKNOWN = 0;
+  LOW = 1;
+  NORMAL = 2;
+  HIGH = 3;
+  URGENT = 4;
+}
+
+// Vehicle reports diagnostic session results
+message DiagnosticSessionResponse {
+  // Session ID from request
+  string session_id = 1;
+
+  // Session status
+  SessionStatus status = 2;
+
+  // DTC report (if requested)
+  DTCReport dtc_report = 3;
+
+  // Snapshot (if requested)
+  VehicleSnapshot snapshot = 4;
+
+  // Log information (if requested)
+  LogUploadInfo log_info = 5;
+
+  // Session duration (seconds)
+  int32 duration_seconds = 6;
+
+  // If status = FAILED, error details
+  com.vehicle.v2c.common.v1.V2CError error = 7;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 8;
+}
+
+enum SessionStatus {
+  SESSION_STATUS_UNKNOWN = 0;
+  STARTED = 1;
+  IN_PROGRESS = 2;
+  COMPLETED = 3;
+  FAILED = 4;
+  CANCELLED = 5;
+  TIMED_OUT = 6;
+}
+
+// ===== Log Upload =====
+
+// Vehicle uploads diagnostic logs
+message LogUploadRequest {
+  // Upload request identifier
+  string upload_id = 1;
+
+  // Log type
+  LogType log_type = 2;
+
+  // Time range for logs
+  TimeRange time_range = 3;
+
+  // Log severity filter
+  repeated LogSeverity severity_filter = 4;
+
+  // ECU filter (specific ECUs)
+  repeated string ecu_filter = 5;
+
+  // Maximum log size (bytes)
+  int64 max_size_bytes = 6;
+
+  // Compression type
+  CompressionType compression = 7;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 8;
+}
+
+message TimeRange {
+  int64 start_time = 1;
+  int64 end_time = 2;
+}
+
+enum LogType {
+  LOG_TYPE_UNKNOWN = 0;
+
+  // Application logs
+  APPLICATION = 1;
+
+  // System logs
+  SYSTEM = 2;
+
+  // CAN bus logs
+  CAN_BUS = 3;
+
+  // Network logs
+  NETWORK = 4;
+
+  // Security logs
+  SECURITY = 5;
+
+  // All logs
+  ALL = 6;
+}
+
+enum LogSeverity {
+  LOG_SEVERITY_UNKNOWN = 0;
+  DEBUG = 1;
+  INFO = 2;
+  WARNING = 3;
+  ERROR = 4;
+  CRITICAL = 5;
+}
+
+enum CompressionType {
+  COMPRESSION_UNKNOWN = 0;
+  NONE = 1;
+  GZIP = 2;
+  ZSTD = 3;
+}
+
+// Log upload information
+message LogUploadInfo {
+  // Upload identifier
+  string upload_id = 1;
+
+  // Upload status
+  UploadStatus status = 2;
+
+  // Presigned S3 URL for upload
+  string upload_url = 3;
+
+  // Log file size (bytes)
+  int64 file_size_bytes = 4;
+
+  // Compressed size (bytes)
+  int64 compressed_size_bytes = 5;
+
+  // Number of log entries
+  int64 entry_count = 6;
+
+  // Time range covered
+  TimeRange time_range = 7;
+
+  // Upload expiry time
+  int64 expires_at = 8;
+
+  // If status = FAILED, error details
+  com.vehicle.v2c.common.v1.V2CError error = 9;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 10;
+}
+
+enum UploadStatus {
+  UPLOAD_STATUS_UNKNOWN = 0;
+  PREPARING = 1;
+  UPLOADING = 2;
+  COMPLETED = 3;
+  FAILED = 4;
+  CANCELLED = 5;
+}
+
+// ===== Predictive Maintenance =====
+
+// Vehicle reports predictive maintenance insights
+message PredictiveMaintenanceReport {
+  // Report identifier
+  string report_id = 1;
+
+  // Report timestamp
+  int64 timestamp = 2;
+
+  // Predicted maintenance items
+  repeated MaintenanceItem maintenance_items = 3;
+
+  // Vehicle health score (0-100)
+  int32 health_score = 4;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 5;
+}
+
+message MaintenanceItem {
+  // Component name
+  string component = 1;
+
+  // Predicted failure probability (0-100%)
+  int32 failure_probability = 2;
+
+  // Estimated remaining life (km)
+  int64 remaining_life_km = 3;
+
+  // Estimated remaining time (days)
+  int32 remaining_days = 4;
+
+  // Recommended action
+  string recommended_action = 5;
+
+  // Urgency level
+  UrgencyLevel urgency = 6;
+
+  // Supporting evidence
+  repeated string evidence = 7;
+}
+
+enum UrgencyLevel {
+  URGENCY_UNKNOWN = 0;
+  SCHEDULE_SOON = 1;
+  SCHEDULE_NEXT_SERVICE = 2;
+  IMMEDIATE_ATTENTION = 3;
+  CRITICAL = 4;
+}

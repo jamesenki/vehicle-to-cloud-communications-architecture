@@ -1,0 +1,53 @@
+@startuml "Lifecycle"
+
+
+participant "Vehicle Application" as application
+participant "Vehicle Edge MQTT Client" as client
+participant "MQTT Broker" as broker
+participant "Vehicle State Service" as vehstat 
+participant "Connected Vehicle Compute" as cvc
+boundary "Incoming Event/Request" as pub
+
+note left of application: This flow assumes \n the previous security \nlifecycle has been\n completed and TLS TCP \n connection established
+
+client -> broker: Connect
+broker -> broker: Authorization check
+broker -> client: ConnectAck
+broker -> vehstat: <client_id> Connected
+application -> broker: Subscribe <topic_id>
+broker -> application: SUBACK
+broker -> vehstat: <client_id> Subscribed to <topic_id>
+
+== Basic Message Exchange On Publish from Server ==
+pub -> cvc: Message/Request for Vehicle
+cvc -> cvc: Create Message
+cvc -> vehstat: isVehicleSubscribed to <topic_id>
+alt Vehicle Connected and Subscribed
+vehstat -> cvc: isVehicleSubscribedResponse (Subscribed)
+note right of vehstat: The response should indicate both connection and subscription status for appropriate action to be taken
+cvc -> broker: Subscribe to <response_topic_id>
+broker -> cvc: SUBACK
+cvc -> broker: Publish to <topic_id> 
+broker -> cvc: PUBACK
+broker <-> application: message received
+application -> broker: ACK (QoS dependent)
+application -> application: deserialize and take action
+application -> application: create response message
+application -> broker: Pubish Response to <response_topic_id>
+broker -> cvc: Response Message
+cvc -> pub: Response Message
+else Client Not Connected/Subscribed
+vehstat -> cvc: isVehicleSubscribedResponse (Not Subscribed)
+ref over cvc 
+Alternative actions when the vehicle not connected are discussed in upcoming sections
+end ref
+
+
+
+
+
+
+
+
+
+@enduml

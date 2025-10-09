@@ -1,0 +1,500 @@
+syntax = "proto3";
+
+package com.vehicle.v2c.common.v1;
+
+// # Common Types and Error Taxonomy
+//
+// This file defines common types, enums, and error handling structures used across
+// the Vehicle-to-Cloud (V2C) communications system. The error taxonomy is designed
+// to support FMEA (Failure Mode and Effects Analysis) and enable systematic error
+// handling, monitoring, and recovery.
+//
+// ## Design Principles
+// 1. **Comprehensive Coverage**: All failure modes have distinct error codes
+// 2. **Actionable**: Each error code has clear retry and recovery guidance
+// 3. **Observable**: Errors are categorized for monitoring and alerting
+// 4. **ISO 21434 Compliant**: Security-related errors are explicitly classified
+//
+// ## Error Code Ranges
+// - 0-99:       Success and informational
+// - 100-199:    Client errors (vehicle-side issues)
+// - 200-299:    Server errors (cloud-side issues)
+// - 300-399:    Network and connectivity errors
+// - 400-499:    Security and authorization errors
+// - 500-599:    Data validation and protocol errors
+// - 600-699:    Resource exhaustion errors
+// - 700-799:    Business logic errors
+//
+
+// ## V2CError Message
+//
+// Standard error structure returned in all failure scenarios. This message should be
+// included in response messages to provide detailed error information.
+//
+// ### Usage Example
+// ```proto
+// message RemoteCommandResponse {
+//     bool success = 1;
+//     V2CError error = 2;  // Populated only if success == false
+//     // ... other fields
+// }
+// ```
+//
+message V2CError {
+    // Error code from ErrorCode enum
+    ErrorCode code = 1;
+
+    // Human-readable error message (English, can be localized client-side)
+    string message = 2;
+
+    // Additional error details as key-value pairs
+    // Examples:
+    //   - "retry_after_seconds": "30"
+    //   - "max_retries_reached": "true"
+    //   - "resource_id": "door_lock_actuator"
+    //   - "expected_value": "LOCKED"
+    //   - "actual_value": "UNLOCKED"
+    map<string, string> details = 3;
+
+    // Timestamp when error occurred (EPOCH milliseconds)
+    int64 timestamp = 4;
+
+    // Trace ID for distributed tracing (128-bit UUID as hex string)
+    string trace_id = 5;
+
+    // Whether this error is retryable (client should retry)
+    bool retryable = 6;
+
+    // Severity level of the error
+    ErrorSeverity severity = 7;
+}
+
+// ## ErrorCode Enum
+//
+// Comprehensive error code taxonomy covering all failure modes identified in FMEA.
+//
+enum ErrorCode {
+    // ========== Success and Informational (0-99) ==========
+
+    // Operation completed successfully
+    SUCCESS = 0;
+
+    // Operation accepted but processing is asynchronous
+    ACCEPTED = 1;
+
+    // Operation partially completed (some sub-operations failed)
+    PARTIAL_SUCCESS = 2;
+
+
+    // ========== Client Errors (100-199) ==========
+
+    // Vehicle device is offline or unreachable
+    // Retryable: Yes (after network recovery)
+    // Mitigation: SMS shoulder tap, wait for vehicle to connect
+    DEVICE_OFFLINE = 100;
+
+    // Request timeout - vehicle did not respond within expected time
+    // Retryable: Yes (with exponential backoff)
+    // Mitigation: Increase timeout, check vehicle connectivity
+    TIMEOUT = 101;
+
+    // Vehicle rejected the command (e.g., safety conditions not met)
+    // Retryable: No (requires state change)
+    // Mitigation: Check preconditions, notify user
+    COMMAND_REJECTED = 102;
+
+    // Vehicle is in wrong state for this operation (e.g., door unlock while driving)
+    // Retryable: No (wait for state change)
+    // Mitigation: Check vehicle state before retry
+    INVALID_STATE = 103;
+
+    // Hardware failure on vehicle (e.g., door actuator malfunction)
+    // Retryable: No (requires physical repair)
+    // Mitigation: Log DTC, schedule service appointment
+    HARDWARE_FAILURE = 104;
+
+    // Software error on vehicle (e.g., unhandled exception)
+    // Retryable: Maybe (after restart)
+    // Mitigation: Log error, potential OTA update
+    VEHICLE_SOFTWARE_ERROR = 105;
+
+    // Battery too low to execute command (e.g., remote start with 5% SoC)
+    // Retryable: Yes (after charging)
+    // Mitigation: Notify user, suggest charging
+    BATTERY_TOO_LOW = 106;
+
+    // GPS/GNSS unavailable (e.g., underground parking)
+    // Retryable: Yes (after vehicle moves to open area)
+    // Mitigation: Return last known location with timestamp
+    GPS_UNAVAILABLE = 107;
+
+    // Duplicate message received (idempotency check failed)
+    // Retryable: No (original already processed)
+    // Mitigation: Return original response if cached
+    DUPLICATE_MESSAGE = 108;
+
+
+    // ========== Server Errors (200-299) ==========
+
+    // Internal server error (unhandled exception)
+    // Retryable: Yes (transient issue)
+    // Mitigation: Alert on-call, check logs
+    INTERNAL_SERVER_ERROR = 200;
+
+    // Service temporarily unavailable (e.g., during deployment)
+    // Retryable: Yes (after backoff)
+    // Mitigation: Return 503, client should retry
+    SERVICE_UNAVAILABLE = 201;
+
+    // Database connection failed
+    // Retryable: Yes (after reconnection)
+    // Mitigation: Use connection pool, circuit breaker
+    DATABASE_ERROR = 202;
+
+    // Message queue (MQTT broker) error
+    // Retryable: Yes (after broker recovery)
+    // Mitigation: Use dead letter queue
+    MESSAGE_QUEUE_ERROR = 203;
+
+    // External service dependency failed (e.g., weather API)
+    // Retryable: Yes (with circuit breaker)
+    // Mitigation: Use cached data or degraded mode
+    EXTERNAL_SERVICE_ERROR = 204;
+
+    // Configuration error (e.g., missing environment variable)
+    // Retryable: No (requires deployment fix)
+    // Mitigation: Alert DevOps, rollback deployment
+    CONFIGURATION_ERROR = 205;
+
+
+    // ========== Network and Connectivity (300-399) ==========
+
+    // Network connection lost during operation
+    // Retryable: Yes (after reconnection)
+    // Mitigation: Resume from last checkpoint
+    NETWORK_ERROR = 300;
+
+    // DNS resolution failed
+    // Retryable: Yes (with different DNS server)
+    // Mitigation: Check DNS configuration
+    DNS_ERROR = 301;
+
+    // TLS/SSL handshake failed
+    // Retryable: No (certificate or crypto issue)
+    // Mitigation: Check certificate validity, crypto suite
+    TLS_HANDSHAKE_FAILED = 302;
+
+    // Certificate expired
+    // Retryable: No (requires certificate rotation)
+    // Mitigation: Trigger certificate renewal workflow
+    CERTIFICATE_EXPIRED = 303;
+
+    // Message too large for network transmission
+    // Retryable: No (requires message splitting)
+    // Mitigation: Implement chunking or compression
+    MESSAGE_TOO_LARGE = 304;
+
+    // Network partition detected (split-brain scenario)
+    // Retryable: Yes (after partition heals)
+    // Mitigation: Use leader election, consensus protocol
+    NETWORK_PARTITION = 305;
+
+
+    // ========== Security and Authorization (400-499) ==========
+
+    // Authentication failed (invalid credentials)
+    // Retryable: No (requires credential update)
+    // Mitigation: Log security event, lock account after N attempts
+    UNAUTHORIZED = 400;
+
+    // Authorization failed (insufficient permissions)
+    // Retryable: No (requires permission grant)
+    // Mitigation: Log access attempt, review ACLs
+    FORBIDDEN = 401;
+
+    // Invalid or expired authentication token
+    // Retryable: Yes (after token refresh)
+    // Mitigation: Refresh JWT token, re-authenticate
+    TOKEN_EXPIRED = 402;
+
+    // Certificate revoked (CRL/OCSP check failed)
+    // Retryable: No (requires new certificate)
+    // Mitigation: Block device, investigate compromise
+    CERTIFICATE_REVOKED = 403;
+
+    // Security policy violation (e.g., rate limit, geo-fence)
+    // Retryable: Maybe (after policy compliance)
+    // Mitigation: Log security event, notify security team
+    SECURITY_POLICY_VIOLATION = 404;
+
+    // Encryption/decryption error
+    // Retryable: No (protocol or key issue)
+    // Mitigation: Check key rotation, protocol version
+    ENCRYPTION_ERROR = 405;
+
+
+    // ========== Data Validation and Protocol (500-599) ==========
+
+    // Invalid message format (protobuf parsing failed)
+    // Retryable: No (sender must fix message)
+    // Mitigation: Log malformed message, return schema
+    INVALID_MESSAGE_FORMAT = 500;
+
+    // Required field missing in message
+    // Retryable: No (sender must provide field)
+    // Mitigation: Return list of missing fields
+    MISSING_REQUIRED_FIELD = 501;
+
+    // Field value out of valid range
+    // Retryable: No (sender must correct value)
+    // Mitigation: Return valid range in error details
+    INVALID_FIELD_VALUE = 502;
+
+    // Protocol version mismatch (incompatible client/server versions)
+    // Retryable: No (requires upgrade)
+    // Mitigation: Return supported versions, trigger OTA
+    PROTOCOL_VERSION_MISMATCH = 503;
+
+    // Message schema validation failed
+    // Retryable: No (schema incompatibility)
+    // Mitigation: Check protobuf schema, version negotiation
+    SCHEMA_VALIDATION_FAILED = 504;
+
+    // Correlation ID not found (orphaned response)
+    // Retryable: No (original request lost)
+    // Mitigation: Log warning, discard message
+    CORRELATION_ID_NOT_FOUND = 505;
+
+
+    // ========== Resource Exhaustion (600-699) ==========
+
+    // Rate limit exceeded (too many requests)
+    // Retryable: Yes (after backoff period)
+    // Mitigation: Implement token bucket, return retry_after
+    RATE_LIMIT_EXCEEDED = 600;
+
+    // Quota exceeded (monthly/daily limit reached)
+    // Retryable: No (until quota reset)
+    // Mitigation: Notify user, upgrade plan
+    QUOTA_EXCEEDED = 601;
+
+    // Connection pool exhausted (no available connections)
+    // Retryable: Yes (after connection release)
+    // Mitigation: Increase pool size, implement backpressure
+    CONNECTION_POOL_EXHAUSTED = 602;
+
+    // Memory limit exceeded (OOM risk)
+    // Retryable: Yes (after garbage collection)
+    // Mitigation: Reduce payload size, scale up instance
+    MEMORY_LIMIT_EXCEEDED = 603;
+
+    // Disk space exhausted
+    // Retryable: No (requires cleanup or scaling)
+    // Mitigation: Purge old data, alert operations
+    DISK_FULL = 604;
+
+    // CPU throttling active (performance degradation)
+    // Retryable: Yes (after load reduction)
+    // Mitigation: Scale horizontally, optimize algorithms
+    CPU_THROTTLED = 605;
+
+
+    // ========== Business Logic Errors (700-799) ==========
+
+    // Vehicle not found in database
+    // Retryable: No (provisioning issue)
+    // Mitigation: Check vehicle provisioning status
+    VEHICLE_NOT_FOUND = 700;
+
+    // Feature not available for this vehicle model/trim
+    // Retryable: No (hardware limitation)
+    // Mitigation: Return available features, suggest upgrade
+    FEATURE_NOT_AVAILABLE = 701;
+
+    // Subscription expired or not active
+    // Retryable: No (requires subscription renewal)
+    // Mitigation: Redirect to subscription portal
+    SUBSCRIPTION_EXPIRED = 702;
+
+    // Geofence violation (operation not allowed in this region)
+    // Retryable: No (wait for vehicle to move)
+    // Mitigation: Notify user, show allowed regions
+    GEOFENCE_VIOLATION = 703;
+
+    // Concurrent operation conflict (another operation in progress)
+    // Retryable: Yes (after current operation completes)
+    // Mitigation: Implement operation queue
+    OPERATION_CONFLICT = 704;
+
+    // Maintenance mode active (system undergoing maintenance)
+    // Retryable: Yes (after maintenance window)
+    // Mitigation: Display maintenance banner, return ETA
+    MAINTENANCE_MODE = 705;
+
+    // OTA update in progress (cannot execute other commands)
+    // Retryable: Yes (after update completes)
+    // Mitigation: Show update progress, estimate completion time
+    OTA_IN_PROGRESS = 706;
+}
+
+// ## ErrorSeverity Enum
+//
+// Severity classification for monitoring, alerting, and incident response.
+//
+enum ErrorSeverity {
+    // Informational - no user impact
+    INFO = 0;
+
+    // Warning - degraded functionality but operation continues
+    WARNING = 1;
+
+    // Error - operation failed but system is stable
+    ERROR = 2;
+
+    // Critical - system instability, requires immediate attention
+    CRITICAL = 3;
+
+    // Fatal - system failure, service down
+    FATAL = 4;
+}
+
+// ## MessageDirection Enum
+//
+// Categorizes message flow direction for routing and monitoring.
+//
+enum MessageDirection {
+    UNKNOWN_DIRECTION = 0;
+    VEHICLE_TO_CLOUD = 1;    // Telemetry, events, diagnostics
+    CLOUD_TO_VEHICLE = 2;    // Commands, OTA, provisioning
+    BIDIRECTIONAL = 3;       // Request/response patterns
+}
+
+// ## QosLevel Enum
+//
+// MQTT Quality of Service levels with semantic descriptions.
+//
+enum QosLevel {
+    // At most once delivery (fire and forget)
+    // Use for: Non-critical telemetry (e.g., periodic location)
+    QOS_0 = 0;
+
+    // At least once delivery (acknowledged)
+    // Use for: Important telemetry, most commands
+    QOS_1 = 1;
+
+    // Exactly once delivery (guaranteed)
+    // Use for: Safety-critical commands, billing events
+    QOS_2 = 2;
+}
+
+// ## VehicleState Enum
+//
+// Vehicle power and connectivity states for precondition checking.
+//
+enum VehicleState {
+    UNKNOWN_STATE = 0;
+    OFF = 1;              // All systems off
+    ACCESSORY = 2;        // Ignition in accessory mode
+    IGNITION_ON = 3;      // Ignition on, engine off
+    ENGINE_RUNNING = 4;   // Engine running
+    CHARGING = 5;         // EV charging (engine off)
+    SLEEPING = 6;         // Low-power sleep mode
+    CONNECTED = 7;        // MQTT connected
+    DISCONNECTED = 8;     // MQTT disconnected
+}
+
+// ## RetryPolicy Message
+//
+// Defines retry behavior for failed operations.
+//
+message RetryPolicy {
+    // Maximum number of retry attempts
+    int32 max_attempts = 1;
+
+    // Initial backoff delay in milliseconds
+    int32 initial_backoff_ms = 2;
+
+    // Backoff multiplier for exponential backoff
+    double backoff_multiplier = 3;
+
+    // Maximum backoff delay in milliseconds
+    int32 max_backoff_ms = 4;
+
+    // Total timeout for all retries in milliseconds
+    int32 total_timeout_ms = 5;
+}
+
+// ## StandardRetryPolicy Message
+//
+// Predefined retry policies for common scenarios.
+//
+message StandardRetryPolicy {
+    // Conservative: 3 attempts, 1s initial, 2x multiplier, 10s max
+    // Use for: Rate limit errors, transient network issues
+    RetryPolicy conservative = 1;
+
+    // Aggressive: 5 attempts, 500ms initial, 1.5x multiplier, 5s max
+    // Use for: Connection errors, database timeouts
+    RetryPolicy aggressive = 2;
+
+    // Patient: 10 attempts, 5s initial, 2x multiplier, 60s max
+    // Use for: Vehicle offline, waiting for state change
+    RetryPolicy patient = 3;
+}
+
+// ## HealthStatus Message
+//
+// Health check response for monitoring and load balancing.
+//
+message HealthStatus {
+    // Overall health status
+    enum Status {
+        HEALTHY = 0;
+        DEGRADED = 1;
+        UNHEALTHY = 2;
+    }
+
+    Status status = 1;
+
+    // Timestamp of health check (EPOCH milliseconds)
+    int64 timestamp = 2;
+
+    // Component-specific health details
+    map<string, string> components = 3;
+
+    // System metrics
+    map<string, double> metrics = 4;
+}
+
+// ## MessageMetadata
+//
+// Metadata for all messages (distributed tracing, observability).
+//
+message MessageMetadata {
+    // Unique message ID (UUID)
+    string message_id = 1;
+
+    // Correlation ID for request/response (UUID)
+    string correlation_id = 2;
+
+    // Distributed tracing trace ID (128-bit hex)
+    string trace_id = 3;
+
+    // Distributed tracing span ID (64-bit hex)
+    string span_id = 4;
+
+    // Timestamp when message was created (EPOCH milliseconds)
+    int64 timestamp = 5;
+
+    // Protocol version (e.g., "1.0", "2.0")
+    string protocol_version = 6;
+
+    // MQTT topic where message was published
+    string topic = 7;
+
+    // QoS level used for this message
+    QosLevel qos = 8;
+
+    // User properties from MQTT header
+    map<string, string> user_properties = 9;
+}

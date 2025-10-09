@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package com.vehicle.v2c.header.v1;
+
+import "vspec.proto"; 
+// # Vehicle Message Header
+//
+// This message defines an application message header for messages past across the system. This is useful because the standard MQTT message headers are typically local to the broker of the system, so while the MQTT headers 
+// are useful for QoS assurances and message debugging they do not necessarily correlate the messages to the 
+// services deeper in the vehicle or the cloud services. 
+//
+// ## Message Orchestration
+// ![HeaderMessage.puml](build/resources/main/V2C/images/HeaderMessage.png)
+//
+// ## MQTT Topic Design
+// | Direction        | Subscribe Topic | Publish Topic | 
+// | -----------      | -----           | --------      |
+// | Vehicle to Cloud | No Topic        | No Topic      |
+// | -----------      | -----           | --------      |
+// | Cloud to Vehicle | No Topic        |  No Topic     |
+//
+//
+message VehicleMessageHeader { 
+int32 message_id = 1; // Unique Application message_id. When initiated from channels like Mobile or API Gateways this should persist all the way to the vehilce, returning as a correlation id.
+int32 correlation_id = 2; // For request/response and other multi-message patterns this should be populated with the message_id of the first message in the chain.
+VehicleVehicleIdentification vehile_identity = 3; // this should be salted and hashed version of the VIN or other Vehicle Identification.
+string vehicle_device_id = 7; // this can be any unique identifier for the vehicle, we recommend using the fingerprint on the client's unique x.509 certificate.
+int64 message_timestamp = 4; // EPOCH timestamp when the message was created
+double protocol_version = 5; // version of the protocol schema/data model being used.
+lat_long location = 6; // GNSS latitude and longtitude 
+
+}
+
+message lat_long { 
+    double latitude = 1; // GNSS latitude
+    double longitude = 2; // GNSS longitude
+}
+

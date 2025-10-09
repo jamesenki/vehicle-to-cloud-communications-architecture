@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+
+<html>
+  <head>
+    <title>Uconnect Global Vehicle to Cloud API's</title>
+    <meta charset="UTF-8">
+      <script type="text/javascript" src="https://code.jquery.com/jquery-2.2.4.min.js"></script>
+    <script type="text/javascript" src="https:code.jquery.com/ui/1.9.2/jquery-ui.js"></script>
+    <link rel="stylesheet" type="text/css" href="https:code.jquery.com/ui/1.9.2/themes/base/jquery-ui.css">
+    <link rel="stylesheet" type="text/css" href="http://fonts.googleapis.com/css?family=Ubuntu:400,700,400italic"/>
+    <script src="https://rawgit.com/google/code-prettify/master/loader/run_prettify.js?autoload=true&amp;skin=sunburst&amp;lang=css" defer></script>
+    <link rel="stylesheet" type="text/css" href="css/fca_style.css"/>
+    
+<script type='text/javascript'>
+
+$(document).ready(function () {
+var prevTop = 0;
+$(document).scroll( function(evt) {
+    var currentTop = $(this).scrollTop();
+    if(currentTop==0)
+    $( "#div1" ).css( "top", "" );
+    else if(prevTop !== currentTop) {
+       prevTop = currentTop;
+	$( "#div1" ).css( "top", "1px" );
+    }else{
+    $( "#div1" ).css( "top", "" );
+    }
+});
+$("#div1").scroll( function(evt) {
+var currentTop = $(this).scrollTop();
+var introDisplay = $("#intro").css("display");
+ if(currentTop<10){
+    if(introDisplay=='block'){
+    $(document).scrollTop(0);
+    $( "#div1" ).css( "top", "" );
+    }
+ }
+ else{
+   $(document).scrollTop(195);
+   if(introDisplay=='block'){
+   $( "#div1" ).css( "top", "1px" );
+   }
+  }
+});
+ $(".proto-head").each(function () {    //loop over each list item
+     var parentdiv = this ;
+	 var  version = " (Version "+$("#change-log tbody",this).find('tr:first').find('td:first').text()+")";
+	 	 $(".version-span", parentdiv).text(version); //append it to the table information
+	});
+ $('tbody').each(function(){
+    $(this).html($.trim($(this).html()))
+  });
+  $('tbody:empty').parents('table').hide();
+ $(".msg-parent").each(function () {    //loop over each list item
+    var exMsg= $(".exmsg-main", this);         //get the msg of the current list item
+    $(".field-table-div", this).append(exMsg); //append it to the table information
+});
+$('.field-table a').click(function (evenet){
+    var content = $(this).attr('href');
+    var content1= content.split('.').join("\\.");
+    $(this).parent().parent().parent().addClass('active');
+        $(this).parent().parent().parent().siblings().removeClass('active');
+        $(content1).parent().show();
+        $(content1).parent().siblings('.proto-head').hide();
+    });
+  $('#toc-container ul li:first').addClass('active');
+    $('.proto-head:not(:first)').hide();
+    $('#toc-container ul li a').click(function (event) {
+    var content = $(this).attr('href');
+    var content1= content.split('.').join("\\.");
+    var isDownloadReq;
+    if(content.indexOf("download")!=-1 && content.indexOf(".proto") !=-1)
+    isDownloadReq=true;
+      if(content.indexOf("code")!=-1 && content.indexOf(".proto") !=-1)
+    isDownloadReq=true;
+    if((content.indexOf(".proto") !=-1 && !isDownloadReq)||content.indexOf("intro")!=-1||content.indexOf("scalar")!=-1 ||content.indexOf("rest-apis")!=-1||
+    content.indexOf("client-code")!=-1||    content.indexOf("service-code")!=-1||
+    content.indexOf("faq")!=-1 ){
+       
+        $(this).parent().addClass('active');
+        $(this).parent().siblings().removeClass('active');
+        $(content1).show();       
+        $(content1).siblings('.proto-head').hide();
+     }else {
+        $(this).parent().parent().parent().addClass('active');
+        $(this).parent().parent().parent().siblings().removeClass('active');
+        $(content1).parent().show();
+        $(content1).parent().siblings('.proto-head').hide();
+     }
+    });
+     $('#compile-list-div ul li a').click(function(event) {
+event.preventDefault();
+  var type = $(this).attr('href');
+  if(type.indexOf('java')!=-1){
+    $('#compile-div span').html('--java_out');
+  }else if(type.indexOf('python')!=-1){
+    $('#compile-div span').html('--python_out');
+  }else if(type.indexOf('csharp')!=-1){
+    $('#compile-div span').html('--csharp_out');
+  }else if(type.indexOf('cpp')!=-1){
+    $('#compile-div span').html('--cpp_out');
+  }
+  });
+  $("iframe").each(function() { 
+        var src= $(this).attr('src');
+        var updatedSrc = src.split('.proto').join("");
+        $(this).attr('src',updatedSrc);  
+    });
+  
+
+ 
+});
+
+//<![CDATA[
+$(window).load(function(){
+$("#div1").resizable({handles: 'e, w'});
+
+
+});//]> 
+</script>
+
+  </head>
+
+  <body>
+
+     <div class="head-table">
+    <div style="display: table-row;line-height: 60px;">
+     <div class="img-div" >
+	  <img src="./images/fca.png">
+	 </div>
+	 <div class="head-div" >
+      <h1 id="title">Uconnect Global Vehicle to Cloud API's</h1>
+     </div>
+    </div>
+  </div>
+    
+    <h4> Version 3.1 </h4>
+    <a href="https://gsdp.github.intra.fcagroup.com/GSDP-V2C/global-api/releases/"><h5>Most Recent Official Release</h5></a>
+
+<div id="parent">
+   <div id="div1" style="white-space:nowrap;overflow:auto;"> 
+   <div id="dragbar"></div>
+  
+   <div id="editor"></div>
+    <h4 style="font-style:normal;">Table of Contents</h4>   
+    <div id="toc-container">
+      <ul id="toc">
+      <li>      <a href="#intro">Introduction</a>
+      </li>
+      <li>
+        <a href="#faq">FAQ</a>
+      </li>
+ 
+        {{#files}}
+        <li>
+          <a href="#{{file_name}}">{{file_name}}</a>
+          <ul>
+            {{#file_messages}}
+            <li>
+              <a href="#{{message_full_name}}">
+                <span class="badge">M</span>
+                {{message_long_name}}
+              </a>
+            </li>
+            {{#message_enums}}
+            <li>
+              <a href="#{{enum_full_name}}">
+                <span class="badge">E</span>
+                {{enum_long_name}}
+              </a>
+            </li>
+           {{/message_enums}}
+            {{/file_messages}}            
+            <li>
+              <a href="#download_{{file_name}}">
+                <span class="badge">P</span>
+					Download ProtoBuf
+              </a>
+            </li>
+            {{#file_services}}
+            <li>
+              <a href="#{{service_full_name}}">
+                <span class="badge">S</span>
+                {{service_name}}
+              </a>
+            </li>
+            {{/file_services}}
+          </ul>
+        </li>
+        {{/files}}
+        <li><a href="#rest-apis">Certificate Management</a></li>
+        <li><a href="#client-code">Simulator client Example Code</a></li>   
+        <li><a href="#service-code">Reference Service Example Code</a></li>         
+      </ul>
+    </div>
+      </div> 
+    <div id="right-div">
+    <div id="intro" class="proto-head">
+<div class="file-heading" style="margin-top:0.1em;">
+<h2 >Introduction</h2>
+</div>
+ <div style="text-align: justify;line-height:1.5;margin-bottom:30em;">
+ <p>The FCA Uconnect Global API’s define a standard data communication protocol for the Telematics Unit in the vehicle to interface with the cloud based Service Delivery Platform (SDP).  The in-vehicle unit consists of either a Telematics Box Module (TBM) or Head Unit (HU), while the SDP can be hosted in any one of many cloud based infrastructures including Amazon Web Services (AWS).</p>
+ 
+ <p>The primary objective of this API is to create interoperability between the FCA regions including APAC, EMEA, LATAM, and NAFTA which with proper adoption will result in efficiency improvements and cost reductions as platforms become more global.  Additionally, the API will improve the FCA Connected Vehicle Platform design for performance, scalability, flexibility, security, maintainability, and cost effectiveness.</p>
+ 
+ <p> The API is based on industry best-practices for the Internet of Things (IoT) including the use of the secure MQTT and HTTP communication protocols.  The need to minimize costly wireless network traffic has also lead to the use of Protocol Buffers for efficiently formatting the data into messages between the client (TBM or HU) and the services (SDP).</p>
+ <p> Additional information about these standards and practices can be found at the addresses listed below</p>
+ <ul>
+ <li><a href="http://mqtt.org">All things MQTT at MQTT.ORG</a></li>
+<li> <a href="http://www.eclipse.org/paho/">Eclipse Paho</a></li>
+<li> <a href="wiki.eclipse.org/Machine-to-Machine"> Eclipse M2M</a></li>
+<li> <a href="http://wiki.eclipse.org/Machine-to-Machine">MQTT: the Smarter Plant (white paper)</a></li>
+<li> <a href="https://developers.google.com/protocol-buffers/docs/proto3">Google Protocol Bufffers</a></li>
+</ul>
+ </div>
+</div>
+<div id="faq" class="proto-head">
+  <div class="file-heading" style="margin-top:0.1em;">
+  <h2 >Frequently Asked Questions (FAQ)</h2></h2>
+  </div>
+  <div class="faq-div"style="text-align: justify;line-height:1.5;">
+  <ul>
+	<li><span>Why use the FCA Global Uconnect V2C API?</span>
+
+	<p>Currently every SDP provider has their own proprietary communication interface with the vehicle.  Everyone is essentially sending very similar data and we have a good understanding of the required data elements.  Rather than continually adapting the vehicle HU/TBM to interface with different SDP providers, this API provides a common interface which is intended to be leveraged on a global basis.</p> 
+   </li>
+	<li><span>What version of MQTT is required?</span>
+
+	<p>The API reference implementation utilizes MQTT 3.1.1.  However, the protocol message structures can be transferred over other messaging protocols as required.    </p>
+   </li>
+   <li><span>Where Can I find Context Diagram for these API's?</span>
+	<p>Here it is. </p>
+	<img class="img-border" style="margin-left:0em;width: 800px;" src="./images/v2cContext.png">
+   </li>
+   <li><span>Can I only use the AWS IoT MQTT Broker?</span>
+
+    <p>No, Any compliant MQTT client library can be used.   The reference implementation utilized AWS IoT for the availability, admin console, policy configuration, and management of device certificates for mutual authentication.</p>
+    <li><span>What is Quality of Service?</span>
+	<p>MQTT defines three levels of Quality of Service (QoS). The QoS defines how hard the broker/client will try to ensure that a message is received. Messages may be sent at any QoS level, and clients may attempt to subscribe to topics at any QoS level. </p>
+	<p>
+	  <ul>
+		<li>0: The broker/client will deliver the message once, with no confirmation.</li>
+
+		<li>1: The broker/client will deliver the message at least once, with confirmation required. </i> This is the recommended QoS level.</i></li>
+
+		<li>2: The broker/client will deliver the message exactly once by using a four step handshake.</li>
+	   </ul>
+	 </p>  
+	</li>
+	
+	<li><span>What MQTT Quality of Service (QoS) Level should be used?</span>
+ 	<p>QoS Level 1 should be used for publishing a message at least once.  The MessageId and CorrelationId can be used to implement de-duplication logic as required.</p>
+    </li>  
+	
+	<li><span>What version of protocol buffers is required?</span>
+  
+ 	<p>The protocol buffer messaging structure utilizes OneOf which is defined in Proto Language Version 3 and supported in version 3.  The Simulator client and service utilize Version 3.3.0 of the compiler or better. </p>
+ 	<p>The protocol buffer messaging structure utilizes OneOf which is defined in Proto Language Version 3 and supported in version 3.  This specification is based on Protobuf language Version 3 - the compiler is version <b>3.30</b> or better </p>
+ 	</li>
+ 	<li><span>When should I update protocol buffer versions?</span>
+ 	<p>Changing Protocol Buffer Versions comes with inherent risks and shall not be done in vehicle or at the server except with FCA approval and following our change and release control processes</p>
+ 
+ 	<p>The protocol buffer messaging structure utilizes OneOf which is defined in Version 3 and supported in version 3.  This specification is based on Protobuf language Version 3 - the compiler is version <b>3.30</b> or better </p>
+  	</li>
+ 	
+ 	<li><span>Can the Protocol Buffer <b>.proto</b> definition files be modified?</span>
+ 	<p>Modifying the protocol buffer .proto files shall only be done at new service versions and must be modified by FCA Interface Architecture and through the change and release control processes</p>
+ 
+ 	<p>The protocol buffer messaging structure utilizes OneOf which is defined in Version 3 and supported in version 3.  This specification is based on Protobuf language Version 3 - the compiler is version <b>3.30</b> or better </p>
+ 	</li>
+	<li><span>Is compression of messages supported?</span>
+	<p>Yes. At the discretion of the sender, messages may be compressed using the format described in <a href="https://tools.ietf.org/html/rfc1952">RFC 1952</a> with the default DEFLATE compression method. Messages compressed in this way can reliably be distinguished from uncompressed messages by the magic number in the gzip message header. Receivers can assume compression if the first two bytes of a message are [0x1f,0x8b] because no valid protocol buffers wire format message can start with this particular sequence.</p>
+	</li>
+	<li><span>What value do I use for the MQTT ClientId?</span>
+	<p>The clientId shall be identified by Uconnect Security during the design phase of the solution.  The recommended approach is to utilize the CN of the Public Certificate assigned to the TBM/HU device. Either through back-end feeds or during the initial CommCheck, the clientID should be associated with a specific VIN</p>
+	</li>
+		
+	<li><span>How Certificate Management Works?</span>
+	<p> Before establishing an MQTT connection, a client must have a certificate for mutual authentication in accordance with security specification CS.00165</p>
+	<p>The Global V2C API includes an interface to allow the TBM/HU to download a X.509 Public Certificate created from an out of band CSR process between the TBM/HU and Global PKI.
+ 	</p>
+	</li>
+	<li><span>How do I find the associated requirements documentation?</span>	
+		<p>The business requirements for the TBM/HU and SDP can be found in the System Function Specification (SFS) documents at the followin link:
+		 <a target="_blank" href="http://collaboration.fg.local/sites/GTBM/Shared%20Documents/NAFTA%20Connected%20Services%20requirements/SFS%20Documents">here</a>
+ 		</p>
+		<p>The implementation requirements for the TBM/HU and SDP can be found in the CTS (Component Technical Specification) and CTDD (Component Technical Design Documents) documents at the followin link:
+		 <a target="_blank" href="https://drive.google.com/drive/folders/0AIEROzwvGSx3Uk9PVA">here</a>
+ 		</p>
+	</li>
+	<li><span>How do I handle Duplicate messages?</span>	
+	<p>Given we are not using MQTT QoS 1 there is the potential to receive a duplicate message.  The HU/TBM client endpoint shall utilize the messageId to reject any duplicate messages.  The SDP service endpoint shall utilize the clientId and messageId to reject any duplicate messages.</p>
+	</li>
+	<li><span>	Do we need to know if the message has been delivered or does it act as fire/forget?</span>	
+	<p>As MQTT defines Quality of Service1 (QoS1), if the Quality of Service is set to 1 then the broker/client will deliver the message atleast once and receiver sends an acknowledgment to the sender.
+	   and The message is deleted from the sender after it has received an acknowledgment from the receiver.</p>
+	   <p>An undelivered message may be removed after a specification defined timeout period, as would be the case with Remote Operations</p>
+	</li>
+	<li><span>How are the various IDs used?</span>	
+	<p>The UconnectMessage contains several IDs for the messages, each is used to create traceability throughout the system. i.e determining duplicates can be done using any combination of MessageID and either SessionID or ServiceID.</p>
+	<p> Messages and their IDs have the following structure</p>
+	<img class="img-border" style="margin-left:0em;width: 800px;" src="./images/MessageIDs.png">
+	</li>
+		
+	<li><span>Are there Any General KPI Requirements?</span>
+	<p>Yes, listed below.</p>
+	<p>
+		<table class="field-table" style="margin-top:2em;"><thead><tr style="text-align:center;">
+		<th>Nbr</th><th>Type</th><th>KPI Requirement</th></tr></thead>
+	    <tbody>
+		 <tr><td style="width: 1em;">1</td><td>Request/Response Message from Vehicle to Cloud</td><td> 5 sec</td></tr>
+		 <tr><td style="width: 1em;">2</td><td>Request/Response Message from Cloud to Vehicle</td><td>5 sec</td></tr>
+	 	 <tr><td style="width: 1em;">3</td><td>Push Message from Vehicle to Cloud </td><td><3 sec</td></tr>
+	 	 <tr><td style="width: 1em;">4</td><td>Push Message from Cloud to Vehicle  </td><td><3 sec</td></tr>
+	</tbody></table>
+	</p>
+	</li>
+	<li><span>How do I log messages for Audit/KPI?</span>
+	<p>For logging purposes,  MQTT packet identifier can be used to find a sender's packets in a receivers's log files. Sender can append the Packet Identifier with the timestamp in the packet.</p>
+    <p>If its KPI for Round trip , Message ID/CorrelationId with other information can be used for Logging.</p>		
+	</li>
+	
+    
+	</li>	
+	<li>
+	<span>
+	What do I need to execute the Simulator client examples?
+	</span>
+	<p>
+	  <ul>
+	   <li>A Java Integrated Development Environment (IDE) such as Eclipse or IntelliJ.</li>
+	   <li> Download the Google Protocol Buffers compiler and ensure you can generate Java code for one of the provided .proto files.</li>
+	   <li> Create a new Java project and import the generated Java source files into your project.</li>
+	  <li> Download the dependent Java libraries and import them into your project:
+ 	   <ul>
+ 			
+		<li>Download the protocol buffers jar file <a href="./lib/protobuf-java-2.6.1.jar" Download>here</a>.</li>
+
+		<li>Download the Paho MQTT client jar file <a href="./lib/org.eclipse.paho.mqtt.utility-1.1.0.jar" Download>here</a>.</li>
+
+		<li>Download the AWS IoT Java Client Library <a href="./lib/aws-java-sdk-iot-1.10.34.jar" Download>here</a>.</li>
+		
+	   </ul>
+	  </li>
+	  <li> Add one of the example client code classes to your project and verify your project builds successfully.</li>
+	  <li> Create or acquire the credentials and endpoint details for the AWS IoT instance to utilze for testing the client.</li>
+	</ul>
+	  
+	</p>
+	</li>
+	
+		
+	<li><span>When should the SessionID field provided in the UconnectMessage be used?</span>
+	<p> Establishing and passing a session id for every message is the best practice for the purposes of auditing and analytics, as well as correlating multi-point and multi-channel feature messages (i.e. Ecall)  </p>
+    	</li>
+		
+<li><span>If a vehicle is offline - how long should messages be held, waiting to Publish</span>
+	<p>For Hight Priority messages an SMS will be sent to wake the vehicle. For all messages with a prescribed KPI or performance target, the message time to live should be less than the performance target. This should be defined in a requirements document give by the specific feature team </p>
+    	</li>		
+	</ul>
+ </div>
+ </div>
+
+    {{#files}}
+    <div class="proto-head"id="{{file_name}}" >
+    <div class="file-heading">
+      <h2 >{{file_name}}<span class="version-span"> (Version 1.0)</span></h2>
+    </div>
+    {{#file_description}}{{#p}}<pre style="
+    font-family: 'Helvetica', sans-serif;">{{{file_description}}}</pre>{{/p}}{{/file_description}}
+    {{#file_messages}}
+	
+    <h3 id="{{message_full_name}}">{{message_long_name}}</h3>
+    <div class="msg-parent">
+    {{#p}}{{{message_description}}}{{/p}}
+    <div class="field-table-div">
+    <table class="field-table">
+      <thead>
+        <tr><td>Field</td><td>Type</td><td>Label</td><td>Description</td></tr>
+      </thead>
+      <tbody>
+        {{#message_fields}}
+        <tr>
+          <td>{{field_name}}</td>
+          <td><a href="#{{field_full_type}}">{{field_long_type}}</a></td>
+          <td>{{field_label}}</td>
+          <td>{{#p}}{{field_description}}{{#field_default_value}} Default: {{field_default_value}}{{/field_default_value}}{{/p}}</td>
+        </tr>
+        {{/message_fields}}
+      </tbody>
+    </table>
+    </div>
+ 	</div>
+    {{#message_enums}}
+    <h3 id="{{enum_full_name}}">{{enum_long_name}}</h3>
+    {{#p}}{{enum_description}}{{/p}}
+    <table class="enum-table">
+      <thead>
+        <tr><td>Name</td><td>Number</td><td>Description</td></tr>
+      </thead>
+      <tbody>
+        {{#enum_values}}
+        <tr>
+          <td>{{value_name}}</td>
+          <td>{{value_number}}</td>
+          <td>{{#p}}{{value_description}}{{/p}}</td>
+        </tr>
+        {{/enum_values}}
+      </tbody>
+    </table>
+    {{/message_enums}}
+    {{#message_has_extensions}}
+    <br>
+    <table class="extension-table">
+      <thead>
+        <tr><td>Extension</td><td>Type</td><td>Base</td><td>Number</td><td>Description</td></tr>
+      </thead>
+      <tbody>
+        {{#message_extensions}}
+        <tr>
+          <td>{{extension_name}}</td>
+          <td><a href="#{{extension_full_type}}">{{extension_long_type}}</a></td>
+          <td><a href="#{{extension_containing_full_type}}">{{extension_containing_long_type}}</a></td>
+          <td>{{extension_number}}</td>
+          <td>{{#p}}{{extension_description}}{{#extension_default_value}} Default: {{extension_default_value}}{{/extension_default_value}}{{/p}}</td>
+        </tr>
+        {{/message_extensions}}
+      </tbody>
+    </table>
+    {{/message_has_extensions}}
+    
+    {{/file_messages}}    
+
+    {{#file_services}}
+    <h3 id="{{service_full_name}}">{{service_name}}</h3>
+    {{#p}}{{service_description}}{{/p}}
+    <table class="enum-table">
+      <thead>
+        <tr><td>Method Name</td><td>Request Type</td><td>Response Type</td><td>Description</td></tr>
+      </thead>
+      <tbody>
+        {{#service_methods}}
+        <tr>
+          <td>{{method_name}}</td>
+          <td><a href="#{{method_request_full_type}}">{{method_request_long_type}}</a></td>
+          <td><a href="#{{method_response_full_type}}">{{method_response_long_type}}</a></td>
+          <td>{{#p}}{{method_description}}{{/p}}</td>
+        </tr>
+        {{/service_methods}}
+      </tbody>
+    </table>
+    {{/file_services}}
+         <h3 id="download_{{file_name}}">Where to Find the ProtoBuf File</h3>
+			Click  <a href="./proto/{{file_name}}"> here</a> to download Protobuf.	
+	
+   
+
+</div>
+    {{/files}}
+        <div  class="proto-head" id="rest-apis" >
+    <h2 >Certificate Management</h2>
+    <iframe src="rest-api.html" style="background: rgb(0, 0, 0);border: currentColor;border-image: none;top: 80px;width: 100%;height: calc(100% + 1900px);bottom: 0px;display: block;position: absolute;"></iframe>
+    </div>
+    <div class="proto-head" id="scalar-value-types">
+   <div class="file-heading" style="margin-top:0.1em;">
+    <h2 style="display:block;">Scalar Value Types </h2>
+    <table class="scalar-value-types-table">
+      <thead>
+        <tr><td>.proto Type</td><td>Notes</td><td>C++ Type</td><td>Java Type</td><td>Python Type</td></tr>
+      </thead>
+      <tbody>
+        <tr id="double">
+          <td>double</td>
+          <td></td>
+          <td>double</td>
+          <td>double</td>
+          <td>float</td>
+        </tr>
+        <tr id="float">
+          <td>float</td>
+          <td></td>
+          <td>float</td>
+          <td>float</td>
+          <td>float</td>
+        </tr>
+        <tr id="int32">
+          <td>int32</td>
+          <td>Uses variable-length encoding. Inefficient for encoding negative numbers – if your field is likely to have negative values, use sint32 instead.</td>
+          <td>int32</td>
+          <td>int</td>
+          <td>int</td>
+        </tr>
+        <tr id="int64">
+          <td>int64</td>
+          <td>Uses variable-length encoding. Inefficient for encoding negative numbers – if your field is likely to have negative values, use sint64 instead.</td>
+          <td>int64</td>
+          <td>long</td>
+          <td>int/long</td>
+        </tr>
+        <tr id="uint32">
+          <td>uint32</td>
+          <td>Uses variable-length encoding.</td>
+          <td>uint32</td>
+          <td>int</td>
+          <td>int/long</td>
+        </tr>
+        <tr id="uint64">
+          <td>uint64</td>
+          <td>Uses variable-length encoding.</td>
+          <td>uint64</td>
+          <td>long</td>
+          <td>int/long</td>
+        </tr>
+        <tr id="sint32">
+          <td>sint32</td>
+          <td>Uses variable-length encoding. Signed int value. These more efficiently encode negative numbers than regular int32s.</td>
+          <td>int32</td>
+          <td>int</td>
+          <td>int</td>
+        </tr>
+        <tr id="sint64">
+          <td>sint64</td>
+          <td>Uses variable-length encoding. Signed int value. These more efficiently encode negative numbers than regular int64s.</td>
+          <td>int64</td>
+          <td>long</td>
+          <td>int/long</td>
+        </tr>
+        <tr id="fixed32">
+          <td>fixed32</td>
+          <td>Always four bytes. More efficient than uint32 if values are often greater than 2^28.</td>
+          <td>uint32</td>
+          <td>int</td>
+          <td>int</td>
+        </tr>
+        <tr id="fixed64">
+          <td>fixed64</td>
+          <td>Always eight bytes. More efficient than uint64 if values are often greater than 2^56.</td>
+          <td>uint64</td>
+          <td>long</td>
+          <td>int/long</td>
+        </tr>
+        <tr id="sfixed32">
+          <td>sfixed32</td>
+          <td>Always four bytes.</td>
+          <td>int32</td>
+          <td>int</td>
+          <td>int</td>
+        </tr>
+        <tr id="sfixed64">
+          <td>sfixed64</td>
+          <td>Always eight bytes.</td>
+          <td>int64</td>
+          <td>long</td>
+          <td>int/long</td>
+        </tr>
+        <tr id="bool">
+          <td>bool</td>
+          <td></td>
+          <td>bool</td>
+          <td>boolean</td>
+          <td>boolean</td>
+        </tr>
+        <tr id="string">
+          <td>string</td>
+          <td>A string must always contain UTF-8 encoded or 7-bit ASCII text.</td>
+          <td>string</td>
+          <td>String</td>
+          <td>str/unicode</td>
+        </tr>
+        <tr id="bytes">
+          <td>bytes</td>
+          <td>May contain any arbitrary sequence of bytes.</td>
+          <td>string</td>
+          <td>ByteString</td>
+          <td>str</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+</div>
+</div>
+</div>
+
+  </body>
+</html>

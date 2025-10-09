@@ -1,0 +1,16 @@
+
+@startuml "Vehicle Message Header"
+
+participant "UUID Service" as UUID
+participant "Feature Application" as FA
+participant " Telematics Client" as TC 
+boundary "Publish" as pub 
+
+FA -> FA: Start <$Message>
+FA -> UUID: Get Unique Message ID
+FA -> FA: Add MessageHeader including Unqique ID to <$Message>
+FA -> TC: Request publish to **featuretopic/vehicleID** 
+TC -> pub: Message published 
+
+
+@enduml

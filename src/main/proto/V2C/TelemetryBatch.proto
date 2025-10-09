@@ -1,0 +1,532 @@
+syntax = "proto3";
+
+package com.vehicle.v2c.telemetrybatch.v1;
+
+import "Common.proto";
+import "Telemetry.proto";
+
+// # Bulk Telemetry Batching Protocol
+//
+// This file defines the protocol for batching multiple telemetry messages
+// into a single MQTT publish to optimize network usage and reduce costs.
+//
+// ## Benefits of Batching
+// - Reduces MQTT message overhead (96% reduction with 25 messages/batch)
+// - Lowers AWS IoT Core costs ($1/million messages → $0.04/million with 25x batch)
+// - Decreases cellular data usage (important for vehicles without WiFi)
+// - Improves throughput by reducing protocol overhead
+//
+// ## Batching Strategy
+// - Vehicle buffers telemetry messages for up to 30 seconds OR until 25 messages
+// - High-priority messages (alerts, errors) are sent immediately without batching
+// - Messages are ordered by timestamp within batch
+// - Optional compression reduces payload size by additional 60-80%
+//
+// ## MQTT Topics
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/telemetry/batch
+// - QoS: 1 (at least once delivery)
+//
+// ## Size Limits
+// - Maximum batch size: 128KB (AWS IoT Core limit)
+// - Recommended batch size: 25-50 messages
+// - Maximum compression time: 100ms (to prevent vehicle ECU overload)
+//
+
+// ===== Telemetry Batch =====
+
+// Container for multiple telemetry messages
+message TelemetryBatch {
+  // Unique batch identifier (UUID)
+  string batch_id = 1;
+
+  // Timestamp when batch was created (EPOCH milliseconds)
+  int64 batch_timestamp = 2;
+
+  // Number of messages in this batch
+  int32 message_count = 3;
+
+  // Batched telemetry messages
+  repeated com.vehicle.v2c.telemetry.v1.VehicleTelemetry telemetry_messages = 4;
+
+  // Compression algorithm applied to messages
+  CompressionType compression = 5;
+
+  // Original size before compression (bytes)
+  int64 uncompressed_size_bytes = 6;
+
+  // Compressed size (bytes)
+  int64 compressed_size_bytes = 7;
+
+  // Time range covered by this batch
+  TimeRange time_range = 8;
+
+  // Batch quality metrics
+  BatchMetrics batch_metrics = 9;
+
+  // Metadata for batch-level tracking
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 10;
+}
+
+enum CompressionType {
+  COMPRESSION_UNKNOWN = 0;
+
+  // No compression applied
+  NONE = 1;
+
+  // GZIP compression (widely supported, moderate ratio)
+  GZIP = 2;
+
+  // Zstandard compression (better ratio, faster)
+  ZSTD = 3;
+
+  // LZ4 compression (fastest, lower ratio)
+  LZ4 = 4;
+}
+
+message TimeRange {
+  // Earliest message timestamp in batch
+  int64 start_time = 1;
+
+  // Latest message timestamp in batch
+  int64 end_time = 2;
+
+  // Duration covered (milliseconds)
+  int64 duration_ms = 3;
+}
+
+message BatchMetrics {
+  // Time spent collecting messages (milliseconds)
+  int32 collection_time_ms = 1;
+
+  // Time spent compressing batch (milliseconds)
+  int32 compression_time_ms = 2;
+
+  // Time spent serializing protobuf (milliseconds)
+  int32 serialization_time_ms = 3;
+
+  // Total batch preparation time (milliseconds)
+  int32 total_preparation_time_ms = 4;
+
+  // Compression ratio (0.0-1.0, e.g., 0.3 = 70% reduction)
+  float compression_ratio = 5;
+
+  // Number of messages dropped due to size limits
+  int32 messages_dropped = 6;
+}
+
+// ===== Batch Configuration =====
+
+// Cloud can configure batching behavior for each vehicle
+message BatchConfiguration {
+  // Enable or disable batching
+  bool batching_enabled = 1;
+
+  // Maximum messages per batch
+  int32 max_messages_per_batch = 2;
+
+  // Maximum batch age before forced publish (seconds)
+  int32 max_batch_age_seconds = 3;
+
+  // Maximum batch size (bytes)
+  int32 max_batch_size_bytes = 4;
+
+  // Compression type to use
+  CompressionType compression_type = 5;
+
+  // Message types that should NEVER be batched (always immediate)
+  repeated string immediate_message_types = 6;
+
+  // Minimum message priority level to batch
+  // Messages with higher priority are sent immediately
+  int32 min_batchable_priority = 7;
+
+  // Enable adaptive batching based on network conditions
+  bool adaptive_batching_enabled = 8;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 9;
+}
+
+// ===== Adaptive Batching =====
+
+// Vehicle can adjust batching parameters based on network conditions
+message AdaptiveBatchingState {
+  // Current network condition
+  NetworkCondition network_condition = 1;
+
+  // Active batch configuration
+  BatchConfiguration active_config = 2;
+
+  // Network quality metrics
+  NetworkQualityMetrics network_metrics = 3;
+
+  // Timestamp when state was updated
+  int64 updated_at = 4;
+}
+
+enum NetworkCondition {
+  NETWORK_CONDITION_UNKNOWN = 0;
+
+  // Excellent network (WiFi, low latency)
+  EXCELLENT = 1;
+
+  // Good network (LTE, normal latency)
+  GOOD = 2;
+
+  // Fair network (3G, higher latency)
+  FAIR = 3;
+
+  // Poor network (2G, high latency/packet loss)
+  POOR = 4;
+
+  // No network (offline mode)
+  OFFLINE = 5;
+}
+
+message NetworkQualityMetrics {
+  // Signal strength (RSSI in dBm)
+  int32 signal_strength_dbm = 1;
+
+  // Network type (LTE, 5G, WiFi)
+  string network_type = 2;
+
+  // Average round-trip time (milliseconds)
+  int32 average_rtt_ms = 3;
+
+  // Packet loss percentage (0-100)
+  float packet_loss_percent = 4;
+
+  // Available bandwidth (kbps)
+  int32 bandwidth_kbps = 5;
+
+  // Jitter (milliseconds)
+  int32 jitter_ms = 6;
+}
+
+// Adaptive batching algorithm suggestions:
+//
+// EXCELLENT (WiFi):
+//   - max_messages_per_batch: 10
+//   - max_batch_age_seconds: 10
+//   - compression: NONE (overhead not worth it)
+//
+// GOOD (LTE):
+//   - max_messages_per_batch: 25
+//   - max_batch_age_seconds: 30
+//   - compression: ZSTD
+//
+// FAIR (3G):
+//   - max_messages_per_batch: 50
+//   - max_batch_age_seconds: 60
+//   - compression: ZSTD
+//
+// POOR (2G):
+//   - max_messages_per_batch: 100
+//   - max_batch_age_seconds: 120
+//   - compression: GZIP
+//
+// OFFLINE:
+//   - Queue messages to local storage
+//   - Flush when network available
+//
+
+// ===== Batch Acknowledgment =====
+
+// Cloud acknowledges receipt of telemetry batch
+message TelemetryBatchAck {
+  // Batch ID being acknowledged
+  string batch_id = 1;
+
+  // Acknowledgment status
+  AckStatus status = 2;
+
+  // Number of messages successfully processed
+  int32 messages_processed = 3;
+
+  // Number of messages that failed validation
+  int32 messages_failed = 4;
+
+  // Failed message indices (if any)
+  repeated int32 failed_message_indices = 5;
+
+  // Validation errors for failed messages
+  repeated com.vehicle.v2c.common.v1.V2CError validation_errors = 6;
+
+  // Timestamp when batch was received
+  int64 received_at = 7;
+
+  // Timestamp when batch processing completed
+  int64 processed_at = 8;
+
+  // Processing duration (milliseconds)
+  int32 processing_duration_ms = 9;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 10;
+}
+
+enum AckStatus {
+  ACK_STATUS_UNKNOWN = 0;
+
+  // All messages processed successfully
+  SUCCESS = 1;
+
+  // Some messages failed validation
+  PARTIAL_SUCCESS = 2;
+
+  // Entire batch failed
+  FAILED = 3;
+
+  // Batch rejected due to duplicate batch_id
+  DUPLICATE = 4;
+
+  // Batch rejected due to size/format issues
+  REJECTED = 5;
+}
+
+// ===== Batch Statistics =====
+
+// Cloud provides batching effectiveness statistics to vehicle
+message BatchingStatistics {
+  // Time period for these statistics
+  TimeRange statistics_period = 1;
+
+  // Total batches sent
+  int32 total_batches = 2;
+
+  // Total individual messages sent
+  int64 total_messages = 3;
+
+  // Average messages per batch
+  float avg_messages_per_batch = 4;
+
+  // Average compression ratio
+  float avg_compression_ratio = 5;
+
+  // Total data sent (compressed, bytes)
+  int64 total_data_sent_bytes = 6;
+
+  // Estimated data without batching (bytes)
+  int64 estimated_unbatched_data_bytes = 7;
+
+  // Data savings from batching (bytes)
+  int64 data_saved_bytes = 8;
+
+  // Data savings percentage
+  float savings_percent = 9;
+
+  // Estimated cost savings (USD)
+  float estimated_cost_savings_usd = 10;
+
+  // Batches that failed
+  int32 failed_batches = 11;
+
+  // Messages that failed validation
+  int64 failed_messages = 12;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 13;
+}
+
+// ===== Offline Queuing =====
+
+// Vehicle reports offline queue status
+message OfflineQueueStatus {
+  // Number of messages queued
+  int32 queued_message_count = 1;
+
+  // Oldest queued message timestamp
+  int64 oldest_message_timestamp = 2;
+
+  // Queue size in bytes
+  int64 queue_size_bytes = 3;
+
+  // Available storage for queue (bytes)
+  int64 available_storage_bytes = 4;
+
+  // Queue status
+  QueueStatus status = 5;
+
+  // Estimated flush time when online (seconds)
+  int32 estimated_flush_time_seconds = 6;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 7;
+}
+
+enum QueueStatus {
+  QUEUE_STATUS_UNKNOWN = 0;
+
+  // Queue healthy, space available
+  HEALTHY = 1;
+
+  // Queue filling up (>80% capacity)
+  WARNING = 2;
+
+  // Queue full, dropping messages
+  FULL = 3;
+
+  // Queue disabled
+  DISABLED = 4;
+}
+
+// ===== Flush Control =====
+
+// Cloud can request immediate flush of pending batches
+message FlushBatchesRequest {
+  // Reason for flush request
+  FlushReason reason = 1;
+
+  // Maximum time to wait for flush (seconds)
+  int32 timeout_seconds = 2;
+
+  // Flush all queued messages (even if offline queue)
+  bool include_offline_queue = 3;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 4;
+}
+
+enum FlushReason {
+  FLUSH_REASON_UNKNOWN = 0;
+
+  // Manual flush requested by operator
+  MANUAL = 1;
+
+  // Configuration change requires fresh data
+  CONFIG_CHANGE = 2;
+
+  // Diagnostic session initiated
+  DIAGNOSTIC_SESSION = 3;
+
+  // Vehicle entering offline mode (park, sleep)
+  OFFLINE_MODE = 4;
+
+  // Critical data needed immediately
+  URGENT_DATA_REQUEST = 5;
+}
+
+// Vehicle reports flush completion
+message FlushBatchesResponse {
+  // Number of batches flushed
+  int32 batches_flushed = 1;
+
+  // Number of messages flushed
+  int64 messages_flushed = 2;
+
+  // Total data sent (bytes)
+  int64 data_sent_bytes = 3;
+
+  // Flush duration (seconds)
+  int32 flush_duration_seconds = 4;
+
+  // Whether flush completed successfully
+  bool flush_successful = 5;
+
+  // Remaining queued messages (if any)
+  int32 remaining_queued_messages = 6;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 7;
+}
+
+// ===== Implementation Notes =====
+//
+// ## Vehicle-Side Implementation
+//
+// ```java
+// class TelemetryBatcher {
+//     private List<VehicleTelemetry> buffer = new ArrayList<>();
+//     private long firstMessageTime = 0;
+//     private BatchConfiguration config;
+//
+//     public void addMessage(VehicleTelemetry message) {
+//         // Check if message should bypass batching
+//         if (isHighPriority(message) || isImmediateType(message)) {
+//             sendImmediately(message);
+//             return;
+//         }
+//
+//         buffer.add(message);
+//         if (buffer.isEmpty()) {
+//             firstMessageTime = System.currentTimeMillis();
+//         }
+//
+//         // Check if batch is ready
+//         if (shouldFlush()) {
+//             flushBatch();
+//         }
+//     }
+//
+//     private boolean shouldFlush() {
+//         long age = System.currentTimeMillis() - firstMessageTime;
+//         return buffer.size() >= config.getMaxMessagesPerBatch()
+//             || age >= config.getMaxBatchAgeSeconds() * 1000;
+//     }
+//
+//     private void flushBatch() {
+//         TelemetryBatch batch = buildBatch();
+//         if (config.getCompressionType() != NONE) {
+//             batch = compress(batch);
+//         }
+//         mqttClient.publish("v2c/v1/{region}/{vehicleId}/telemetry/batch", batch);
+//         buffer.clear();
+//         firstMessageTime = 0;
+//     }
+// }
+// ```
+//
+// ## Cloud-Side Processing
+//
+// ```java
+// public void processBatch(TelemetryBatch batch) {
+//     // Decompress if needed
+//     if (batch.getCompression() != NONE) {
+//         batch = decompress(batch);
+//     }
+//
+//     // Process each message
+//     List<Integer> failedIndices = new ArrayList<>();
+//     for (int i = 0; i < batch.getMessageCount(); i++) {
+//         VehicleTelemetry msg = batch.getTelemetryMessages(i);
+//         try {
+//             processMessage(msg);
+//         } catch (ValidationException e) {
+//             failedIndices.add(i);
+//         }
+//     }
+//
+//     // Send acknowledgment
+//     TelemetryBatchAck ack = buildAck(batch, failedIndices);
+//     mqttClient.publish("v2c/v1/{region}/{vehicleId}/telemetry/ack", ack);
+// }
+// ```
+//
+// ## Bandwidth Savings Calculation
+//
+// Without batching:
+//   - MQTT overhead per message: ~45 bytes
+//   - Average telemetry message: 150 bytes
+//   - Total per message: 195 bytes
+//   - 1000 messages: 195 KB
+//
+// With batching (25 messages/batch):
+//   - MQTT overhead: 45 bytes × 40 batches = 1.8 KB
+//   - Message data: 150 bytes × 1000 = 150 KB
+//   - Protobuf batch overhead: ~1 KB
+//   - Total before compression: 152.8 KB
+//   - After ZSTD compression (70%): 45.8 KB
+//   - **Savings: 76.5%**
+//
+// ## Cost Savings (AWS IoT Core)
+//
+// Pricing: $1.00 per million messages
+//
+// Without batching:
+//   - 1 million telemetry messages = $1.00
+//
+// With batching (25x):
+//   - 1 million messages / 25 = 40,000 MQTT messages
+//   - Cost: $0.04
+//   - **Savings: $0.96 per million messages (96%)**
+//

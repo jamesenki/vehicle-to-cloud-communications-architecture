@@ -1,0 +1,25 @@
+@startuml
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+' uncomment the following line and comment the first to use locally
+' !include C4_Component.puml
+
+LAYOUT_TOP_DOWN()
+
+title Component diagram for Internet Banking System - API Application
+
+Container(Cloud, "Cloud System Broker", "MQTT and Protobuf", "Communicates with Vehicle, providing value add services")
+Container_Boundary(vehicle, "Vehicle") {
+Container_Boundary(v2c, "Vehicle to Cloud System") {
+    Component(TPM, "Vehicle to Cloud Identity", "Certificate identity for vehicle communication device")
+    Component(client, "Communication Client", "MQTT Client", "Manages two way communication with broker")
+    Component(services, "various services detailed in spec", "C or Rust applications", "Provide funtions like routing, UUID generation etc.")
+
+Container_Boundary(Bus, "Telematics data bus and apis")
+Container_Boundary(HSM, "Vehicle Identity and HW Private Key")
+}
+}
+
+Rel(v2c, Cloud, "Uses", "mTLS/MQTT")
+
+@enduml

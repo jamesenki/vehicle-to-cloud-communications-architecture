@@ -1,0 +1,104 @@
+plugins {
+    id "com.google.protobuf" version "0.9.4"
+    id "java"
+}
+
+group 'com.vehicle.v2c'
+version '1.0.0'
+
+sourceCompatibility = 11
+targetCompatibility = 11
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Protocol Buffers
+    implementation 'com.google.protobuf:protobuf-java:3.21.12'
+    implementation 'com.google.protobuf:protobuf-java-util:3.21.12'
+
+    // gRPC
+    implementation 'io.grpc:grpc-netty-shaded:1.51.1'
+    implementation 'io.grpc:grpc-protobuf:1.51.1'
+    implementation 'io.grpc:grpc-stub:1.51.1'
+    compileOnly 'org.apache.tomcat:annotations-api:6.0.53' // needed for @Generated annotation
+
+    // Testing
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'io.grpc:grpc-testing:1.51.1'
+}
+sourceSets {
+    main {
+        proto { 
+            srcDir 'src/main/proto'
+            
+            include '**/*.proto'
+        }
+        java {
+            srcDirs 'build/generated/source/main/java'
+        }
+    }
+}
+protobuf {
+    generatedFilesBaseDir = "$projectDir/src"
+
+    protoc {
+        // Align protoc version with protobuf-java version
+        artifact = 'com.google.protobuf:protoc:3.21.12'
+    }
+
+    plugins {
+        // gRPC plugin - updated to match grpc-all version
+        grpc {
+            artifact = 'io.grpc:protoc-gen-grpc-java:1.51.1'
+        }
+
+        // Documentation generator
+        doc {
+            artifact = "io.github.pseudomuto:protoc-gen-doc:1.5.1"
+        }
+    }
+
+    generateProtoTasks {
+        processResources() {
+            duplicatesStrategy = 'EXCLUDE'
+        }
+
+        all().each { task ->
+            // Generate code for multiple languages
+            task.builtins {
+                // Java (primary language)
+                java {
+                    outputSubDir = 'java'
+                }
+
+                // C++ for embedded vehicle systems
+                cpp {
+                    outputSubDir = 'cpp'
+                }
+
+                // Python for cloud services and testing
+                python {
+                    outputSubDir = 'python'
+                }
+            }
+
+            task.plugins {
+                // gRPC service stubs for Java
+                grpc {
+                    outputSubDir = 'java'
+                }
+
+                // Generate Markdown documentation
+                doc {
+                    option 'markdown,v2c.md'
+                }
+            }
+        }
+    }
+}
+    
+    
+    
+

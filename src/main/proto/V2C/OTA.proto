@@ -1,0 +1,685 @@
+syntax = "proto3";
+
+package com.vehicle.v2c.ota.v1;
+
+import "Common.proto";
+
+// # Over-The-Air (OTA) Update Protocol
+//
+// This file defines the complete OTA update orchestration protocol for vehicle
+// firmware and software updates. The protocol supports:
+// - Update availability notification
+// - User consent and scheduling
+// - Secure download with resume capability
+// - Installation with rollback support
+// - Progress tracking and status reporting
+//
+// ## Security Requirements
+// - All update packages MUST be signed with HSM-backed private key
+// - Vehicle MUST verify signature before installation
+// - Download URLs MUST be time-limited (presigned, 1-hour expiry)
+// - Installation MUST be atomic (all-or-nothing)
+//
+// ## MQTT Topics
+// - Cloud → Vehicle: v2c/v1/{region}/{vehicle_id}/ota/available
+// - Cloud → Vehicle: v2c/v1/{region}/{vehicle_id}/ota/download
+// - Cloud → Vehicle: v2c/v1/{region}/{vehicle_id}/ota/install
+// - Cloud → Vehicle: v2c/v1/{region}/{vehicle_id}/ota/rollback
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/ota/accept
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/ota/progress
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/ota/complete
+//
+
+// ===== OTA Update Availability =====
+
+// Notifies vehicle that a software update is available
+message OTAUpdateAvailable {
+  // Unique update identifier (UUID)
+  string update_id = 1;
+
+  // Human-readable update version (e.g., "2.5.0")
+  string version = 2;
+
+  // Update type (determines installation behavior)
+  UpdateType update_type = 3;
+
+  // Update priority (affects scheduling)
+  UpdatePriority priority = 4;
+
+  // Package size in bytes
+  int64 size_bytes = 5;
+
+  // Release notes (markdown format, max 5KB)
+  string release_notes = 6;
+
+  // Minimum battery level required (percentage)
+  int32 min_battery_level = 7;
+
+  // Update can be installed while driving
+  bool can_install_while_driving = 8;
+
+  // Estimated installation time (seconds)
+  int32 estimated_install_time_sec = 9;
+
+  // Update expiry timestamp (EPOCH milliseconds)
+  // After this time, update is no longer valid
+  int64 expires_at = 10;
+
+  // Metadata for tracking
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 11;
+}
+
+enum UpdateType {
+  UPDATE_TYPE_UNKNOWN = 0;
+
+  // Full system image replacement
+  FULL_SYSTEM = 1;
+
+  // Incremental delta update (smaller download)
+  DELTA = 2;
+
+  // Security patch only
+  SECURITY_PATCH = 3;
+
+  // Feature update (new functionality)
+  FEATURE = 4;
+
+  // Bug fix
+  BUGFIX = 5;
+
+  // Configuration change only (no code)
+  CONFIG = 6;
+}
+
+enum UpdatePriority {
+  PRIORITY_UNKNOWN = 0;
+
+  // Can be deferred by user
+  LOW = 1;
+
+  // Should be installed soon
+  MEDIUM = 2;
+
+  // Important security or bug fix
+  HIGH = 3;
+
+  // Critical security vulnerability, mandatory
+  CRITICAL = 4;
+}
+
+// ===== OTA Update Acceptance =====
+
+// Vehicle accepts or rejects the update offer
+message OTAUpdateAccept {
+  // Update ID from OTAUpdateAvailable
+  string update_id = 1;
+
+  // User/vehicle decision
+  AcceptanceStatus status = 2;
+
+  // If DEFERRED or REJECTED, reason code
+  string reason = 3;
+
+  // If DEFERRED, proposed installation time
+  int64 scheduled_install_time = 4;
+
+  // Current vehicle state
+  VehicleState vehicle_state = 5;
+
+  // Current battery level (percentage)
+  int32 battery_level = 6;
+
+  // Available storage space (bytes)
+  int64 available_storage_bytes = 7;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 8;
+}
+
+enum AcceptanceStatus {
+  ACCEPTANCE_UNKNOWN = 0;
+
+  // Vehicle ready to download immediately
+  ACCEPTED = 1;
+
+  // User postponed installation
+  DEFERRED = 2;
+
+  // User declined update
+  REJECTED = 3;
+
+  // Vehicle conditions not met (battery, storage)
+  PRECONDITIONS_NOT_MET = 4;
+}
+
+message VehicleState {
+  // Vehicle power state
+  PowerState power_state = 1;
+
+  // Vehicle in motion
+  bool is_moving = 2;
+
+  // Ignition state
+  bool ignition_on = 3;
+
+  // Parking brake engaged
+  bool parking_brake_engaged = 4;
+}
+
+enum PowerState {
+  POWER_STATE_UNKNOWN = 0;
+  OFF = 1;
+  ACCESSORY = 2;
+  IGNITION_ON = 3;
+  ENGINE_RUNNING = 4;
+  CHARGING = 5;
+}
+
+// ===== OTA Download =====
+
+// Initiates firmware download to vehicle
+message OTADownloadRequest {
+  // Update ID
+  string update_id = 1;
+
+  // Presigned download URL (S3, CloudFront)
+  // URL expires in 1 hour
+  string download_url = 2;
+
+  // SHA-256 checksum of complete file
+  string checksum_sha256 = 3;
+
+  // Digital signature (signed with OTA signing key)
+  bytes signature = 4;
+
+  // Package size in bytes
+  int64 size_bytes = 5;
+
+  // Support for resume (HTTP Range requests)
+  bool supports_resume = 6;
+
+  // Recommended chunk size for download (bytes)
+  int32 chunk_size_bytes = 7;
+
+  // Maximum download time before timeout (seconds)
+  int32 max_download_time_sec = 8;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 9;
+}
+
+// Vehicle reports download progress
+message OTADownloadProgress {
+  // Update ID
+  string update_id = 1;
+
+  // Download status
+  DownloadStatus status = 2;
+
+  // Bytes downloaded so far
+  int64 bytes_downloaded = 3;
+
+  // Total bytes to download
+  int64 total_bytes = 4;
+
+  // Download speed (bytes per second)
+  int64 speed_bps = 5;
+
+  // Estimated time remaining (seconds)
+  int32 eta_seconds = 6;
+
+  // If status = FAILED, error details
+  com.vehicle.v2c.common.v1.V2CError error = 7;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 8;
+}
+
+enum DownloadStatus {
+  DOWNLOAD_STATUS_UNKNOWN = 0;
+
+  // Download initiated
+  STARTED = 1;
+
+  // Downloading in progress
+  IN_PROGRESS = 2;
+
+  // Download paused (can be resumed)
+  PAUSED = 3;
+
+  // Download completed successfully
+  COMPLETED = 4;
+
+  // Download failed
+  FAILED = 5;
+
+  // Verifying checksum
+  VERIFYING = 6;
+}
+
+// ===== OTA Installation =====
+
+// Instructs vehicle to begin installation
+message OTAInstallRequest {
+  // Update ID
+  string update_id = 1;
+
+  // Installation mode
+  InstallMode install_mode = 2;
+
+  // Force installation even if preconditions not met
+  bool force_install = 3;
+
+  // Create backup of current firmware before install
+  bool create_backup = 4;
+
+  // Automatically rollback if installation fails
+  bool auto_rollback_on_failure = 5;
+
+  // Maximum installation time (seconds)
+  int32 max_install_time_sec = 6;
+
+  // Post-installation verification tests to run
+  repeated string verification_tests = 7;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 8;
+}
+
+enum InstallMode {
+  INSTALL_MODE_UNKNOWN = 0;
+
+  // Install immediately
+  IMMEDIATE = 1;
+
+  // Install when vehicle is next powered off
+  NEXT_POWER_OFF = 2;
+
+  // Install at specific time
+  SCHEDULED = 3;
+
+  // Install when vehicle is idle (parked, charged)
+  IDLE = 4;
+}
+
+// Vehicle reports installation progress
+message OTAInstallProgress {
+  // Update ID
+  string update_id = 1;
+
+  // Installation status
+  InstallStatus status = 2;
+
+  // Installation progress (0-100%)
+  int32 progress_percent = 3;
+
+  // Current installation phase
+  InstallPhase current_phase = 4;
+
+  // Estimated time remaining (seconds)
+  int32 eta_seconds = 5;
+
+  // If status = FAILED, error details
+  com.vehicle.v2c.common.v1.V2CError error = 6;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 7;
+}
+
+enum InstallStatus {
+  INSTALL_STATUS_UNKNOWN = 0;
+
+  // Installation started
+  STARTED = 1;
+
+  // Installing in progress
+  IN_PROGRESS = 2;
+
+  // Installation completed successfully
+  COMPLETED = 3;
+
+  // Installation failed
+  FAILED = 4;
+
+  // Running post-installation verification
+  VERIFYING = 5;
+
+  // Verification passed
+  VERIFIED = 6;
+
+  // Verification failed, rolling back
+  ROLLBACK_IN_PROGRESS = 7;
+
+  // Rolled back to previous version
+  ROLLED_BACK = 8;
+}
+
+enum InstallPhase {
+  INSTALL_PHASE_UNKNOWN = 0;
+
+  // Pre-installation checks
+  PRE_INSTALL_CHECKS = 1;
+
+  // Creating backup
+  BACKUP_CREATION = 2;
+
+  // Extracting update package
+  EXTRACTION = 3;
+
+  // Applying firmware update
+  APPLYING_UPDATE = 4;
+
+  // Updating bootloader
+  BOOTLOADER_UPDATE = 5;
+
+  // Rebooting system
+  REBOOTING = 6;
+
+  // Post-installation verification
+  POST_INSTALL_VERIFICATION = 7;
+
+  // Cleanup temporary files
+  CLEANUP = 8;
+}
+
+// Installation completion report
+message OTAInstallComplete {
+  // Update ID
+  string update_id = 1;
+
+  // Final status
+  CompletionStatus status = 2;
+
+  // Installed firmware version
+  string installed_version = 3;
+
+  // Previous firmware version (for rollback reference)
+  string previous_version = 4;
+
+  // Installation duration (seconds)
+  int32 duration_seconds = 5;
+
+  // Verification test results
+  repeated VerificationResult verification_results = 6;
+
+  // If status = FAILED, error details
+  com.vehicle.v2c.common.v1.V2CError error = 7;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 8;
+}
+
+enum CompletionStatus {
+  COMPLETION_STATUS_UNKNOWN = 0;
+
+  // Installation successful, all tests passed
+  SUCCESS = 1;
+
+  // Installation failed
+  FAILED = 2;
+
+  // Installation succeeded but verification failed
+  SUCCESS_WITH_WARNINGS = 3;
+
+  // Rolled back to previous version
+  ROLLED_BACK = 4;
+}
+
+message VerificationResult {
+  // Test name
+  string test_name = 1;
+
+  // Test result
+  bool passed = 2;
+
+  // Test duration (milliseconds)
+  int32 duration_ms = 3;
+
+  // Error message if failed
+  string error_message = 4;
+}
+
+// ===== OTA Rollback =====
+
+// Instructs vehicle to rollback to previous firmware version
+message OTARollbackRequest {
+  // Update ID that should be rolled back
+  string update_id = 1;
+
+  // Reason for rollback
+  RollbackReason reason = 2;
+
+  // Target version to roll back to
+  string target_version = 3;
+
+  // Force rollback even if risky
+  bool force_rollback = 4;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 5;
+}
+
+enum RollbackReason {
+  ROLLBACK_REASON_UNKNOWN = 0;
+
+  // Post-installation tests failed
+  VERIFICATION_FAILED = 1;
+
+  // Critical bug found in new version
+  CRITICAL_BUG = 2;
+
+  // User requested rollback
+  USER_REQUEST = 3;
+
+  // System instability detected
+  SYSTEM_INSTABILITY = 4;
+
+  // Fleet-wide rollback directive
+  FLEET_ROLLBACK = 5;
+}
+
+// Vehicle reports rollback progress
+message OTARollbackProgress {
+  // Update ID being rolled back
+  string update_id = 1;
+
+  // Rollback status
+  RollbackStatus status = 2;
+
+  // Progress percentage (0-100%)
+  int32 progress_percent = 3;
+
+  // If status = FAILED, error details
+  com.vehicle.v2c.common.v1.V2CError error = 4;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 5;
+}
+
+enum RollbackStatus {
+  ROLLBACK_STATUS_UNKNOWN = 0;
+
+  // Rollback initiated
+  STARTED = 1;
+
+  // Rollback in progress
+  IN_PROGRESS = 2;
+
+  // Rollback completed successfully
+  COMPLETED = 3;
+
+  // Rollback failed (vehicle may be bricked!)
+  FAILED = 4;
+}
+
+// ===== OTA Status Query =====
+
+// Cloud requests current OTA status from vehicle
+message OTAStatusRequest {
+  // Include download history
+  bool include_download_history = 1;
+
+  // Include installation history
+  bool include_install_history = 2;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 3;
+}
+
+// Vehicle reports current OTA status
+message OTAStatusResponse {
+  // Current firmware version
+  string current_version = 1;
+
+  // Previous firmware version (if any)
+  string previous_version = 2;
+
+  // Active update (if any)
+  ActiveUpdate active_update = 3;
+
+  // Recent update history
+  repeated UpdateHistoryEntry update_history = 4;
+
+  // System health after last update
+  SystemHealth system_health = 5;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 6;
+}
+
+message ActiveUpdate {
+  // Update ID
+  string update_id = 1;
+
+  // Current status
+  string status = 2;
+
+  // Progress percentage (0-100%)
+  int32 progress_percent = 3;
+
+  // Started timestamp
+  int64 started_at = 4;
+}
+
+message UpdateHistoryEntry {
+  // Update ID
+  string update_id = 1;
+
+  // From version
+  string from_version = 2;
+
+  // To version
+  string to_version = 3;
+
+  // Update timestamp
+  int64 updated_at = 4;
+
+  // Final status
+  string status = 5;
+
+  // Duration (seconds)
+  int32 duration_seconds = 6;
+}
+
+message SystemHealth {
+  // Overall health status
+  HealthStatus health_status = 1;
+
+  // Boot count since last update
+  int32 boot_count = 2;
+
+  // Crash count since last update
+  int32 crash_count = 3;
+
+  // System uptime (seconds)
+  int64 uptime_seconds = 4;
+
+  // Critical errors logged
+  int32 error_count = 5;
+}
+
+enum HealthStatus {
+  HEALTH_STATUS_UNKNOWN = 0;
+  HEALTHY = 1;
+  DEGRADED = 2;
+  UNHEALTHY = 3;
+}
+
+// ===== OTA Campaign Management =====
+
+// Defines an OTA campaign targeting a fleet segment
+message OTACampaign {
+  // Unique campaign identifier
+  string campaign_id = 1;
+
+  // Campaign name
+  string campaign_name = 2;
+
+  // Update ID to deploy
+  string update_id = 3;
+
+  // Target vehicle filter (SQL-like expression)
+  // Example: "model = 'Accord' AND year >= 2023"
+  string target_filter = 4;
+
+  // Rollout strategy
+  RolloutStrategy rollout_strategy = 5;
+
+  // Campaign start time
+  int64 start_time = 6;
+
+  // Campaign end time
+  int64 end_time = 7;
+
+  // Maximum failures before auto-pause
+  int32 max_failures = 8;
+
+  // Campaign status
+  CampaignStatus status = 9;
+}
+
+message RolloutStrategy {
+  // Rollout type
+  RolloutType type = 1;
+
+  // Percentage of fleet (for PERCENTAGE type)
+  int32 percentage = 2;
+
+  // Number of vehicles per batch (for BATCHED type)
+  int32 batch_size = 3;
+
+  // Delay between batches (seconds)
+  int32 batch_delay_seconds = 4;
+
+  // Canary group size (vehicles to test first)
+  int32 canary_size = 5;
+
+  // Canary observation period (seconds)
+  int32 canary_observation_period_seconds = 6;
+}
+
+enum RolloutType {
+  ROLLOUT_TYPE_UNKNOWN = 0;
+
+  // All vehicles simultaneously
+  ALL_AT_ONCE = 1;
+
+  // Percentage-based gradual rollout
+  PERCENTAGE = 2;
+
+  // Fixed-size batches
+  BATCHED = 3;
+
+  // Canary deployment (test group first)
+  CANARY = 4;
+}
+
+enum CampaignStatus {
+  CAMPAIGN_STATUS_UNKNOWN = 0;
+  DRAFT = 1;
+  SCHEDULED = 2;
+  ACTIVE = 3;
+  PAUSED = 4;
+  COMPLETED = 5;
+  CANCELLED = 6;
+}

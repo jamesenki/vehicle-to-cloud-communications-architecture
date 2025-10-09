@@ -1,0 +1,642 @@
+syntax = "proto3";
+
+package com.vehicle.v2c.commandcancellation.v1;
+
+import "Common.proto";
+
+// # Command Cancellation Protocol
+//
+// This file defines the protocol for canceling in-flight remote commands
+// and handling partial execution cleanup.
+//
+// ## Use Cases
+// - User changes mind after initiating command
+// - Command taking longer than expected
+// - Safety condition changed (e.g., vehicle started moving)
+// - System detected unsafe condition
+// - Timeout occurred
+// - Application crash/restart recovery
+//
+// ## Cancellation Behavior
+// - Commands can be cancelled while QUEUED or IN_PROGRESS
+// - Already COMPLETED commands cannot be cancelled (but may be reversed)
+// - Vehicle performs best-effort cancellation and cleanup
+// - Partial execution may occur (e.g., door unlocked before cancellation)
+// - Cancellation is idempotent (duplicate cancellations are safe)
+//
+// ## MQTT Topics
+// - Cloud → Vehicle: v2c/v1/{region}/{vehicle_id}/command/cancel
+// - Vehicle → Cloud: v2c/v1/{region}/{vehicle_id}/command/cancel/ack
+//
+// ## QoS Recommendations
+// - Cancellation request: QoS 2 (exactly once, safety-critical)
+// - Cancellation acknowledgment: QoS 1
+//
+
+// ===== Command Cancellation Request =====
+
+// Cloud requests cancellation of a command
+message CancelCommandRequest {
+  // Unique cancellation request ID
+  string cancellation_id = 1;
+
+  // Command ID to cancel
+  string command_id = 2;
+
+  // User who initiated cancellation
+  string user_id = 3;
+
+  // Reason for cancellation
+  CancellationReason reason = 4;
+
+  // Cancellation priority
+  CancellationPriority priority = 5;
+
+  // Whether to perform cleanup/rollback
+  bool cleanup_required = 6;
+
+  // Maximum time to wait for cancellation (seconds)
+  int32 timeout_seconds = 7;
+
+  // Force cancellation even if risky
+  bool force_cancel = 8;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 9;
+}
+
+enum CancellationReason {
+  CANCELLATION_REASON_UNKNOWN = 0;
+
+  // User manually cancelled
+  USER_CANCELLED = 1;
+
+  // Command timed out
+  TIMEOUT = 2;
+
+  // Unsafe condition detected
+  UNSAFE_CONDITION = 3;
+
+  // Vehicle state changed
+  VEHICLE_STATE_CHANGED = 4;
+
+  // System error
+  SYSTEM_ERROR = 5;
+
+  // Application restart/recovery
+  SYSTEM_RECOVERY = 6;
+
+  // Superseded by newer command
+  SUPERSEDED = 7;
+
+  // Invalid command parameters
+  INVALID_COMMAND = 8;
+}
+
+enum CancellationPriority {
+  CANCELLATION_PRIORITY_UNKNOWN = 0;
+
+  // Normal priority
+  NORMAL = 1;
+
+  // High priority (safety-related)
+  HIGH = 2;
+
+  // Emergency stop
+  EMERGENCY = 3;
+}
+
+// ===== Command Cancellation Response =====
+
+// Vehicle acknowledges cancellation request
+message CancelCommandResponse {
+  // Cancellation ID from request
+  string cancellation_id = 1;
+
+  // Command ID that was cancelled
+  string command_id = 2;
+
+  // Cancellation status
+  CancellationStatus status = 3;
+
+  // Command state when cancellation received
+  CommandStateAtCancellation command_state = 4;
+
+  // Cleanup actions performed
+  repeated CleanupAction cleanup_actions = 5;
+
+  // Time taken to cancel (milliseconds)
+  int32 cancellation_time_ms = 6;
+
+  // Whether partial execution occurred
+  bool partial_execution_occurred = 7;
+
+  // Description of partial state (if any)
+  string partial_state_description = 8;
+
+  // If status = FAILED, error details
+  com.vehicle.v2c.common.v1.V2CError error = 9;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 10;
+}
+
+enum CancellationStatus {
+  CANCELLATION_STATUS_UNKNOWN = 0;
+
+  // Cancellation successful, command stopped
+  CANCELLED = 1;
+
+  // Command already completed, cannot cancel
+  ALREADY_COMPLETED = 2;
+
+  // Command not found (may have already finished)
+  COMMAND_NOT_FOUND = 3;
+
+  // Cancellation failed
+  FAILED = 4;
+
+  // Cancellation in progress
+  IN_PROGRESS = 5;
+
+  // Partial cancellation (some actions irreversible)
+  PARTIAL_CANCELLATION = 6;
+}
+
+message CommandStateAtCancellation {
+  // Command execution status when cancelled
+  ExecutionStatus execution_status = 1;
+
+  // Progress percentage when cancelled (0-100)
+  int32 progress_percent = 2;
+
+  // Actions completed before cancellation
+  repeated string completed_actions = 3;
+
+  // Actions pending at cancellation
+  repeated string pending_actions = 4;
+}
+
+enum ExecutionStatus {
+  EXECUTION_STATUS_UNKNOWN = 0;
+  QUEUED = 1;
+  IN_PROGRESS = 2;
+  COMPLETED = 3;
+  FAILED = 4;
+}
+
+message CleanupAction {
+  // Action type
+  CleanupActionType action_type = 1;
+
+  // Action description
+  string description = 2;
+
+  // Whether cleanup was successful
+  bool success = 3;
+
+  // If failed, error message
+  string error_message = 4;
+}
+
+enum CleanupActionType {
+  CLEANUP_ACTION_UNKNOWN = 0;
+
+  // Rolled back partial changes
+  ROLLBACK = 1;
+
+  // Released resources (locks, connections)
+  RELEASE_RESOURCES = 2;
+
+  // Reset actuators to safe state
+  RESET_ACTUATORS = 3;
+
+  // Cleared internal state
+  CLEAR_STATE = 4;
+
+  // Logged cancellation event
+  LOG_EVENT = 5;
+
+  // Notified other systems
+  NOTIFY_SYSTEMS = 6;
+}
+
+// ===== Timeout Management =====
+
+// Cloud configures command timeout policies
+message TimeoutConfiguration {
+  // Default timeout for all commands (seconds)
+  int32 default_timeout_seconds = 1;
+
+  // Per-command type timeouts
+  map<string, int32> command_timeouts = 2;
+
+  // Enable auto-cancellation on timeout
+  bool auto_cancel_on_timeout = 3;
+
+  // Retry before cancellation
+  bool retry_before_cancel = 4;
+
+  // Maximum retry attempts
+  int32 max_retry_attempts = 5;
+
+  // Retry delay (seconds)
+  int32 retry_delay_seconds = 6;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 7;
+}
+
+// Vehicle reports command timeout
+message CommandTimeoutEvent {
+  // Event identifier
+  string event_id = 1;
+
+  // Command ID that timed out
+  string command_id = 2;
+
+  // When timeout occurred
+  int64 timeout_timestamp = 3;
+
+  // Configured timeout (seconds)
+  int32 configured_timeout_seconds = 4;
+
+  // Actual execution time (seconds)
+  int32 actual_execution_seconds = 5;
+
+  // Command state at timeout
+  CommandStateAtCancellation command_state = 6;
+
+  // Auto-cancelled or requires manual cancellation
+  bool auto_cancelled = 7;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 8;
+}
+
+// ===== Bulk Cancellation =====
+
+// Cancel multiple commands at once
+message BulkCancelRequest {
+  // Unique bulk cancellation ID
+  string bulk_cancellation_id = 1;
+
+  // Command IDs to cancel
+  repeated string command_ids = 2;
+
+  // User who initiated bulk cancellation
+  string user_id = 3;
+
+  // Reason for bulk cancellation
+  CancellationReason reason = 4;
+
+  // Maximum time for bulk operation (seconds)
+  int32 timeout_seconds = 5;
+
+  // Continue on individual failures
+  bool continue_on_failure = 6;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 7;
+}
+
+// Bulk cancellation response
+message BulkCancelResponse {
+  // Bulk cancellation ID from request
+  string bulk_cancellation_id = 1;
+
+  // Individual cancellation results
+  repeated CancelCommandResponse results = 2;
+
+  // Summary statistics
+  BulkCancellationSummary summary = 3;
+
+  // Total time taken (seconds)
+  int32 total_time_seconds = 4;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 5;
+}
+
+message BulkCancellationSummary {
+  // Total commands requested to cancel
+  int32 total_requested = 1;
+
+  // Successfully cancelled
+  int32 successfully_cancelled = 2;
+
+  // Already completed
+  int32 already_completed = 3;
+
+  // Not found
+  int32 not_found = 4;
+
+  // Failed to cancel
+  int32 failed = 5;
+
+  // Partial cancellations
+  int32 partial = 6;
+}
+
+// ===== Cancel All Commands =====
+
+// Cancel all pending commands for this vehicle
+message CancelAllCommandsRequest {
+  // Unique request ID
+  string request_id = 1;
+
+  // User who initiated
+  string user_id = 2;
+
+  // Reason for cancelling all
+  CancellationReason reason = 3;
+
+  // Filter by command type (optional)
+  repeated string command_type_filter = 4;
+
+  // Filter by priority (optional)
+  repeated int32 priority_filter = 5;
+
+  // Maximum age of commands to cancel (seconds)
+  // Only cancel commands younger than this
+  int32 max_age_seconds = 6;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 7;
+}
+
+// Cancel all response
+message CancelAllCommandsResponse {
+  // Request ID
+  string request_id = 1;
+
+  // Number of commands found
+  int32 commands_found = 2;
+
+  // Number successfully cancelled
+  int32 commands_cancelled = 3;
+
+  // Individual results
+  repeated CancelCommandResponse individual_results = 4;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 5;
+}
+
+// ===== Command Reversal =====
+
+// For commands that completed but need to be reversed
+// (e.g., door locked, but user wants it unlocked)
+message ReverseCommandRequest {
+  // Unique reversal request ID
+  string reversal_id = 1;
+
+  // Original command ID to reverse
+  string original_command_id = 2;
+
+  // User who initiated reversal
+  string user_id = 3;
+
+  // Reason for reversal
+  ReversalReason reason = 4;
+
+  // Create new command for reversal or best-effort undo
+  bool create_reversal_command = 5;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 6;
+}
+
+enum ReversalReason {
+  REVERSAL_REASON_UNKNOWN = 0;
+
+  // User changed mind
+  USER_CHANGED_MIND = 1;
+
+  // Command executed incorrectly
+  INCORRECT_EXECUTION = 2;
+
+  // Unintended consequence
+  UNINTENDED_CONSEQUENCE = 3;
+
+  // Testing/development
+  TEST_REVERSAL = 4;
+
+  // Safety reason
+  SAFETY_REVERSAL = 5;
+}
+
+// Reversal response
+message ReverseCommandResponse {
+  // Reversal ID from request
+  string reversal_id = 1;
+
+  // Original command ID
+  string original_command_id = 2;
+
+  // Reversal status
+  ReversalStatus status = 3;
+
+  // New command ID if reversal created new command
+  string new_command_id = 4;
+
+  // Actions taken to reverse
+  repeated CleanupAction reversal_actions = 5;
+
+  // If status = FAILED, error details
+  com.vehicle.v2c.common.v1.V2CError error = 6;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 7;
+}
+
+enum ReversalStatus {
+  REVERSAL_STATUS_UNKNOWN = 0;
+
+  // Successfully reversed
+  REVERSED = 1;
+
+  // Reversal command created and queued
+  REVERSAL_COMMAND_CREATED = 2;
+
+  // Original command not reversible
+  NOT_REVERSIBLE = 3;
+
+  // Original command not found
+  COMMAND_NOT_FOUND = 4;
+
+  // Reversal failed
+  FAILED = 5;
+
+  // Partial reversal
+  PARTIAL_REVERSAL = 6;
+}
+
+// ===== Cancellation Audit Trail =====
+
+// Comprehensive audit record for cancellation
+message CancellationAuditRecord {
+  // Audit record ID
+  string audit_id = 1;
+
+  // Cancellation ID
+  string cancellation_id = 2;
+
+  // Command ID
+  string command_id = 3;
+
+  // User who cancelled
+  string user_id = 4;
+
+  // Cancellation timestamp
+  int64 timestamp = 5;
+
+  // Cancellation reason
+  CancellationReason reason = 6;
+
+  // Original command details
+  OriginalCommandDetails original_command = 7;
+
+  // Cancellation result
+  CancellationStatus result = 8;
+
+  // Partial execution details
+  string partial_execution_details = 9;
+
+  // Cleanup actions performed
+  repeated CleanupAction cleanup_actions = 10;
+
+  // IP address of cancellation request
+  string source_ip = 11;
+
+  // Application/client that requested
+  string source_application = 12;
+
+  // Metadata
+  com.vehicle.v2c.common.v1.MessageMetadata metadata = 13;
+}
+
+message OriginalCommandDetails {
+  // Command type
+  string command_type = 1;
+
+  // When command was originally sent
+  int64 sent_at = 2;
+
+  // When command started executing
+  int64 started_at = 3;
+
+  // Command priority
+  int32 priority = 4;
+
+  // Original user who sent command
+  string original_user_id = 5;
+}
+
+// ===== Implementation Examples =====
+//
+// ## Vehicle-Side Cancellation Handler
+//
+// ```java
+// class CommandCancellationHandler {
+//     private Map<String, CommandExecutor> activeCommands = new ConcurrentHashMap<>();
+//
+//     public CancelCommandResponse cancelCommand(CancelCommandRequest request) {
+//         String commandId = request.getCommandId();
+//         CommandExecutor executor = activeCommands.get(commandId);
+//
+//         if (executor == null) {
+//             return CancelCommandResponse.newBuilder()
+//                 .setCancellationId(request.getCancellationId())
+//                 .setCommandId(commandId)
+//                 .setStatus(CancellationStatus.COMMAND_NOT_FOUND)
+//                 .build();
+//         }
+//
+//         if (executor.isCompleted()) {
+//             return CancelCommandResponse.newBuilder()
+//                 .setCancellationId(request.getCancellationId())
+//                 .setCommandId(commandId)
+//                 .setStatus(CancellationStatus.ALREADY_COMPLETED)
+//                 .build();
+//         }
+//
+//         // Attempt cancellation
+//         CommandStateAtCancellation state = executor.getState();
+//         List<CleanupAction> cleanupActions = new ArrayList<>();
+//
+//         try {
+//             executor.cancel();
+//
+//             if (request.getCleanupRequired()) {
+//                 cleanupActions.addAll(executor.performCleanup());
+//             }
+//
+//             activeCommands.remove(commandId);
+//
+//             return CancelCommandResponse.newBuilder()
+//                 .setCancellationId(request.getCancellationId())
+//                 .setCommandId(commandId)
+//                 .setStatus(CancellationStatus.CANCELLED)
+//                 .setCommandState(state)
+//                 .addAllCleanupActions(cleanupActions)
+//                 .setPartialExecutionOccurred(executor.hasPartialExecution())
+//                 .build();
+//
+//         } catch (CancellationException e) {
+//             return CancelCommandResponse.newBuilder()
+//                 .setCancellationId(request.getCancellationId())
+//                 .setCommandId(commandId)
+//                 .setStatus(CancellationStatus.FAILED)
+//                 .setError(buildError(e))
+//                 .build();
+//         }
+//     }
+// }
+// ```
+//
+// ## Race Condition Handling
+//
+// Scenario: Cancellation arrives after command completes
+//
+// ```
+// Timeline:
+// T0: Command received and queued
+// T1: Command execution starts
+// T2: Command completes successfully
+// T3: Cancellation request arrives
+//
+// Correct Response:
+// - Return CancellationStatus.ALREADY_COMPLETED
+// - Suggest ReverseCommandRequest if reversal is possible
+// - Log race condition in audit trail
+// ```
+//
+// ## Timeout Auto-Cancellation
+//
+// ```java
+// class TimeoutMonitor implements Runnable {
+//     private Map<String, CommandContext> pendingCommands;
+//     private TimeoutConfiguration config;
+//
+//     @Override
+//     public void run() {
+//         long now = System.currentTimeMillis();
+//
+//         for (CommandContext ctx : pendingCommands.values()) {
+//             long elapsed = now - ctx.getStartTime();
+//             int timeout = getTimeoutForCommand(ctx.getCommandType());
+//
+//             if (elapsed > timeout * 1000) {
+//                 if (config.getRetryBeforeCancel() && ctx.getRetryCount() < config.getMaxRetryAttempts()) {
+//                     retryCommand(ctx);
+//                 } else if (config.getAutoCancelOnTimeout()) {
+//                     autoCancelCommand(ctx);
+//                 } else {
+//                     notifyTimeout(ctx);
+//                 }
+//             }
+//         }
+//     }
+// }
+// ```
