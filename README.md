@@ -1,21 +1,37 @@
+# Vehicle to Cloud Communications Architecture
+
+Production-ready MQTT 5.0 communications platform for connected vehicles with comprehensive Protocol Buffer specifications, AsyncAPI documentation, and FMEA-validated architecture.
+
+## Documentation
+
+### 📘 Core References
+- **[API and Protocol Reference](docs/API_AND_PROTOCOL_REFERENCE.md)** - Complete MQTT topics and Protocol Buffer specifications
+- **[Architecture Review](ARCHITECTURE_REVIEW.md)** - System architecture and design decisions
+
+### 🔒 Security & Compliance
+- **[ISO 21434 TARA](docs/security/ISO_21434_TARA.md)** - Threat Analysis and Risk Assessment
+- **[PII Data Governance](docs/security/PII_DATA_GOVERNANCE.md)** - Personal data handling policies
+- **[Certificate Lifecycle](docs/security/CERTIFICATE_LIFECYCLE.md)** - PKI and certificate management
+- **[Audit Logging](docs/security/AUDIT_LOGGING.md)** - Security event logging
+
+### 🛠️ Implementation Guides
+- **[Topic Naming Convention](docs/standards/TOPIC_NAMING_CONVENTION.md)** - MQTT topic structure standards
+- **[QoS Selection Guide](docs/standards/QOS_SELECTION_GUIDE.md)** - Quality of Service level selection
+- **[Topic Aliases](docs/implementation/TOPIC_ALIASES.md)** - Bandwidth optimization with aliases
+
+### 🔍 Failure Mode Analysis
+- **[FMEA: Remote Door Lock](docs/fmea/FMEA_REMOTE_DOOR_LOCK.md)** - Comprehensive failure mode analysis for remote door locking
+
+---
+
+## Table of Contents
 - [Project Definition](#project-definition)
 - [Scope](#scope)
 - [General Architecture](#general-architecture)
 - [Potential Use Cases](#potential-use-cases)
 - [Introduction](#introduction)
-  - [Contributions](#contributions)
-    - [Calls for Help](#calls-for-help)
 - [MQTT V5](#mqtt-v5)
 - [MQTT Communication Management](#mqtt-communication-management)
-  - [Security Recommendations](#security-recommendations)
-  - [Compliance](#compliance)
-  - [MQTT Publish and Subscribe Lifecycle](#mqtt-publish-and-subscribe-lifecycle)
-    - [The Importance of State](#the-importance-of-state)
-    - [Handling High Priority Message Vs. Low Priority Messages](#handling-high-priority-message-vs-low-priority-messages)
-  - [Message IDs](#message-ids)
-  - [MQTT Client Connection](#mqtt-client-connection)
-  - [MQTT Request and Response Headers](#mqtt-request-and-response-headers)
-  - [Dealing with Corner Cases](#dealing-with-corner-cases)
 
 ## Project Definition
 The intention of this project is to produce a prescriptive specification for the production, consumption and orchestration of messages between connected vehicle devices and the cloud using MQTT and Protocol Buffers, inclusive of recommendations for vehicle identity, security and system architecture.  
@@ -30,26 +46,6 @@ Documentation of recommended basic practices for MQTT V5 based vehicle to cloud 
 
 ## General Architecture
 ![C4 Project Architecture](src/main/doc/images/C4_Project_Architecture.png)
-
-## Documentation
-
-### 📘 Core References
-- [API and Protocol Reference](docs/API_AND_PROTOCOL_REFERENCE.md) - Complete MQTT topics and Protocol Buffer specifications
-- [Architecture Review](ARCHITECTURE_REVIEW.md) - System architecture and design decisions
-
-### 🔒 Security & Compliance
-- [ISO 21434 TARA](docs/security/ISO_21434_TARA.md) - Threat Analysis and Risk Assessment
-- [PII Data Governance](docs/security/PII_DATA_GOVERNANCE.md) - Personal data handling policies
-- [Certificate Lifecycle](docs/security/CERTIFICATE_LIFECYCLE.md) - PKI and certificate management
-- [Audit Logging](docs/security/AUDIT_LOGGING.md) - Security event logging
-
-### 🛠️ Implementation Guides
-- [Topic Naming Convention](docs/standards/TOPIC_NAMING_CONVENTION.md) - MQTT topic structure standards
-- [QoS Selection Guide](docs/standards/QOS_SELECTION_GUIDE.md) - Quality of Service level selection
-- [Topic Aliases](docs/implementation/TOPIC_ALIASES.md) - Bandwidth optimization with aliases
-
-### 🔍 Failure Mode Analysis
-- [FMEA: Remote Door Lock](docs/fmea/FMEA_REMOTE_DOOR_LOCK.md) - Comprehensive failure mode analysis for remote door locking
 
 ## Potential Use Cases
 * Vehicle and Vehicle Device Provisioning
