@@ -1,0 +1,364 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define CRITICAL_COLOR #FF4757
+
+title Diagnostics Flow Part 4C: Multi-Channel Customer Notification
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+
+' Participants
+participant "DTC Processor" as DTCProcessor #LightYellow
+participant "Customer Notification\n[Multi-Channel]" as Notification #LightCyan
+participant "Emergency Towing\n[3rd Party API]" as Towing #FF4757
+participant "Monitoring" as Monitor #Orange
+actor "Vehicle Owner\n[Mobile App]" as Owner #LightBlue
+
+note over DTCProcessor, Owner
+**Prerequisite**: DTC processed and recommendations ready (see 04b-ml-analysis.puml)
+**Notification Channels**: Push (FCM), Email (SES), SMS (SNS)
+**Severity-Based Routing**: CRITICAL → All channels, MEDIUM → Push + Email
+end note
+
+== DTC Severity-Based Routing ==
+
+DTCProcessor -> DTCProcessor: Evaluate DTC severity: MEDIUM
+
+alt Severity: CRITICAL (Do Not Drive)
+    DTCProcessor -> Towing: POST /dispatch
+    activate Towing
+    note right
+    {vehicle_id, location,
+    dtc_code, urgency: CRITICAL}
+    end note
+
+    Towing -> Towing: Find nearest towing provider (ETA <30 min)
+    Towing --> DTCProcessor: Towing dispatched
+    deactivate Towing
+    note right
+    {provider: "AAA Towing",
+    eta_minutes: 22,
+    driver_phone: "+1-415-555-0199",
+    case_id: "TOW-2025-4521"}
+    end note
+
+    DTCProcessor -> Notification: SEND URGENT (all channels)
+
+    note right #FF4757
+    **CRITICAL DTC Examples**:
+    - P0601: ECU internal error
+    - P0850: Park/Neutral switch failure
+    - C1288: Brake pressure sensor fault
+
+    **Actions**:
+    1. Immediate towing dispatch
+    2. Multi-channel notifications
+    3. Disable remote start
+    4. Alert OEM support center
+    end note
+
+    DTCProcessor -> Monitor: ALERT: CRITICAL DTC detected
+
+    alt Towing Dispatch Failure
+        Towing --> DTCProcessor: ERROR: No available tow trucks
+        DTCProcessor -> Notification: ESCALATE
+        note right
+        - Display emergency roadside number
+        - Send alternative providers
+        end note
+        DTCProcessor -> Monitor: CRITICAL: Towing dispatch failed
+
+        note right #FF6B6B
+        **FMEA: Towing Unavailable**
+        Severity: 9 (stranded driver)
+        RPN: 18
+        Mitigation: Multi-provider network
+        end note
+    end
+
+else Severity: HIGH (Service Immediately)
+    DTCProcessor -> Notification: SEND HIGH PRIORITY
+    note right
+    Channels: Push + Email + In-vehicle display
+    end note
+
+    note right #FFD93D
+    **HIGH DTC Examples**:
+    - P0300: Random misfire
+    - P0420: Catalyst efficiency
+    - C0050: Wheel speed sensor
+
+    **Actions**:
+    - Push notification within 5 min
+    - Service booking link
+    - Max driving range: 100 km
+    end note
+
+else Severity: MEDIUM (Service Soon)
+    DTCProcessor -> Notification: SEND NORMAL PRIORITY
+    note right
+    Channels: Push (next app open) + Email (daily digest)
+    end note
+
+    note right
+    **MEDIUM DTCs**:
+    - Schedule within 500 km
+    - Non-urgent repairs
+    - No immediate safety risk
+    - Example: P0171 (lean condition)
+    end note
+
+else Severity: LOW or INFO
+    DTCProcessor -> DTCProcessor: Log only, no immediate notification
+    note right
+    **LOW/INFO DTCs**:
+    - Schedule at next service
+    - Informational only
+    end note
+end
+
+== Customer Notification Delivery ==
+
+DTCProcessor -> Notification: Send Multi-Channel Notification
+activate Notification
+note right
+{vehicle_id, owner_id,
+dtc_summary, recommendations,
+urgency: MEDIUM}
+end note
+
+Notification -> Notification: Load owner preferences
+note right
+**Notification Preferences**:
+- Push: enabled
+- Email: enabled
+- SMS: critical only
+- Quiet hours: 22:00-08:00
+- Language: en-US
+end note
+
+== Push Notification (FCM) ==
+
+Notification -> Notification: Send Push Notification (FCM)
+
+alt Push Notification Success
+    Notification -> Notification: FCM delivery successful
+    note right #6BCF7F
+    **Push Stats**:
+    - Delivery rate: 95%
+    - P50 latency: 2s
+    - P99 latency: 8s
+    - Open rate: 42%
+    end note
+
+else Push Failure (Invalid Token)
+    Notification -> Notification: FCM error: Invalid token
+    Notification -> Notification: Mark token as invalid, remove from DB
+    Notification -> Monitor: WARNING: Invalid FCM token
+
+    note right #FFD93D
+    **FMEA: Invalid Push Token**
+    Severity: 4, RPN: 16
+    Mitigation: Fallback to email/SMS
+    end note
+
+else Push Failure (FCM Service Down)
+    Notification -> Notification: FCM error: Service unavailable
+    Notification -> Notification: Retry with exponential backoff (3 attempts)
+
+    alt All Retries Failed
+        Notification -> Monitor: CRITICAL: FCM service outage
+        Notification -> Notification: Fallback to SMS
+
+        note right #FF6B6B
+        **FMEA: FCM Service Outage**
+        Severity: 6, RPN: 6
+        Mitigation: Multi-channel delivery
+        end note
+    end
+end
+
+== Email Notification (SES) ==
+
+Notification -> Notification: Send Email (AWS SES)
+
+alt Email Delivery Success
+    Notification -> Notification: SES accepted (MessageID: 01000192...)
+    note right #6BCF7F
+    **Email Stats**:
+    - Delivery rate: 99.2%
+    - Bounce rate: 0.5%
+    - Open rate: 38%
+    end note
+
+else Email Failure (Bounce)
+    Notification -> Notification: SES bounce notification received
+    Notification -> Notification: Update email status: bounced
+    Notification -> Monitor: INFO: Email bounced
+
+    note right #FFD93D
+    **FMEA: Email Bounce**
+    Severity: 3, RPN: 27
+    Mitigation: Request email update
+    end note
+
+else Email Failure (Throttling)
+    Notification -> Notification: SES throttling: Rate limit exceeded
+    Notification -> Notification: Enqueue for delayed retry (5 min)
+    Notification -> Monitor: WARNING: SES throttling
+
+    note right #FFD93D
+    **FMEA: SES Throttling**
+    Severity: 2, RPN: 4
+    Mitigation: Increase SES sending rate
+    end note
+end
+
+== SMS Notification (SNS) ==
+
+alt Severity CRITICAL or HIGH
+    Notification -> Notification: Send SMS (AWS SNS)
+
+    alt SMS Delivery Success
+        Notification -> Notification: SNS accepted (MessageID: sms-abc123)
+        note right #6BCF7F
+        **SMS Stats**:
+        - Delivery rate: 97%
+        - P50 latency: 4s
+        - P99 latency: 15s
+        - Cost: $0.00645 per SMS (US)
+        end note
+
+    else SMS Failure (Invalid Number)
+        Notification -> Notification: SNS error: Invalid phone number
+        Notification -> Monitor: WARNING: Invalid phone number
+        note right #FFD93D
+        **FMEA: Invalid Phone**
+        Severity: 5, RPN: 10
+        end note
+
+    else SMS Failure (SNS Down)
+        Notification -> Notification: SNS error: Service unavailable
+        Notification -> Notification: Retry (3 attempts, 10s delay)
+
+        alt All Retries Failed
+            Notification -> Monitor: CRITICAL: SNS service outage
+            note right #FF6B6B
+            **FMEA: SNS Service Outage**
+            Severity: 7, RPN: 7
+            Mitigation: Multi-channel redundancy
+            end note
+        end
+    end
+
+else Severity MEDIUM, LOW, INFO
+    Notification -> Notification: Skip SMS (per preference)
+end
+
+Notification --> DTCProcessor: Notification delivery report
+deactivate Notification
+note right
+{push: SUCCESS,
+email: SUCCESS,
+sms: SUCCESS,
+delivered_at: 1728518450}
+end note
+
+deactivate DTCProcessor
+
+== Owner Receives Notification ==
+
+Notification -> Owner: Push Notification
+activate Owner
+note right
+"Vehicle Maintenance Alert
+
+DTC P0171 detected: Engine running lean.
+Service recommended within 500 km.
+
+Tap for details."
+end note
+
+Owner -> Owner: Open mobile app
+Owner -> Owner: View DTC details
+note right
+**Mobile App Details**:
+- Code: P0171
+- Description: System too lean (Bank 1)
+- Severity: Medium
+- Action: Replace MAF sensor
+- Cost: $225 (covered under warranty)
+- Nearest dealers: [3 options]
+- Freeze frame data visualization
+end note
+
+Owner -> Owner: Tap "Schedule Service"
+
+note right
+**Mobile App Features**:
+- DTC history (last 5 years)
+- Service recommendations
+- Dealer booking integration
+- Warranty status
+- Estimated repair costs
+end note
+
+deactivate Owner
+
+== Monitoring and Alerting ==
+
+Monitor -> Monitor: Aggregate DTC metrics every 60s
+note right
+**Real-Time Metrics**:
+- DTC reports/min: 1,250
+- Processing latency P99: 2.8s
+- Error rate: 0.3%
+- ML inference success: 97%
+- Notification delivery: 96%
+end note
+
+alt Error Rate > 5%
+    Monitor -> Monitor: Trigger PagerDuty alert: P1 incident
+    note right
+    "DTC processing error rate spike (8.2%)"
+    end note
+
+else Notification Delivery < 90%
+    Monitor -> Monitor: Trigger alert
+    note right
+    "Notification delivery: 87% (threshold: 90%)"
+    end note
+
+else DTC Processing Latency P99 > 5s
+    Monitor -> Monitor: Trigger alert
+    note right
+    "DTC processing P99: 6.2s (threshold: 5s)"
+    end note
+end
+
+note over DTCProcessor, Owner
+**Phase 4C Complete: Customer Notified via Multiple Channels**
+
+**Notification Delivery Summary**:
+- Push notification: ✓ Delivered (2s latency)
+- Email: ✓ Delivered (99.2% delivery rate)
+- SMS: Skipped (severity: MEDIUM, per user preference)
+
+**Success Metrics**:
+- End-to-end latency: 8.5s (P99)
+- Notification delivery rate: 96%
+- Customer engagement: 42% open rate
+
+**Business Impact**:
+- Proactive maintenance: 34% reduction in roadside breakdowns
+- Customer satisfaction: +18 NPS points
+- Warranty claims: 12% reduction (early detection)
+- Average repair cost: -$145 (vs. reactive maintenance)
+
+**See also**:
+- 04a-dtc-detection.puml for DTC detection and reporting
+- 04b-ml-analysis.puml for ML prediction and recommendations
+end note
+
+@enduml

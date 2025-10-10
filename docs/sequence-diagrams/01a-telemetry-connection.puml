@@ -1,0 +1,134 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define RETRY_COLOR #4ECDC4
+
+title Telemetry Flow Part 1A: Connection Establishment - Vehicle-to-Cloud
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+
+' Define participants
+actor "Vehicle ECU\n[Sampling: 1-10min]" as ECU
+participant "MQTT Client\n[Paho v5, Keep-Alive: 40min]" as MQTTClient
+participant "AWS IoT Core\n[Max Packet: 128KB, Timeout: 30s]" as IoTCore
+participant "CloudWatch\n[Metrics Resolution: 1min]" as CloudWatch
+participant "SNS Alerts\n[Threshold: 5 failures/min]" as SNS
+
+== Phase 1: Connection Establishment (Cold Start) ==
+
+note over ECU, CloudWatch
+**Cold Start Scenario**: Vehicle powers on, establishes connection
+**Frequency**: ~12 times per day (avg. vehicle usage)
+**Network Cost**: ~4.5KB for TLS handshake
+end note
+
+ECU -> MQTTClient: Power on, initialize MQTT client
+activate MQTTClient
+
+MQTTClient -> MQTTClient: Load certificates from HSM/TPM
+note right
+**Certificate Validation**:
+- ECC P-256 or RSA 2048-bit
+- 1-year validity
+- CN: Vehicle VIN
+- Storage: FIPS 140-2 Level 2+
+end note
+
+MQTTClient -> IoTCore: CONNECT (MQTT 5.0, Clean Session=false, Keep-Alive=2400s)
+activate IoTCore
+
+alt #SUCCESS_COLOR mTLS Certificate Valid
+    IoTCore -> IoTCore: Validate X.509 certificate chain
+    IoTCore -> IoTCore: Check certificate not revoked (OCSP/CRL)
+    IoTCore -> IoTCore: Verify CN matches registered vehicle VIN
+
+    IoTCore -> CloudWatch: Log connection event (vehicle_id, timestamp, IP)
+    IoTCore --> MQTTClient: CONNACK (Session Present=true, Max Packet=131072)
+
+    MQTTClient -> IoTCore: Subscribe to command topic with QoS 1
+    note right
+    **Topic**: v2c/v1/{region}/{vehicle_id}/command/request
+    **QoS**: 1 (at-least-once delivery)
+    **Session**: Persistent (Clean Session=false)
+    end note
+
+    IoTCore --> MQTTClient: SUBACK (QoS 1 granted)
+
+    MQTTClient -> CloudWatch: Publish connection success metric
+    note right #6BCF7F
+    **Metric**: mqtt.connection.success
+    **Dimension**: region, vehicle_model
+    **MTBF**: 99.95% uptime SLA
+    end note
+
+else #FAILURE_COLOR Certificate Expired
+    IoTCore -> CloudWatch: CRITICAL: Certificate expired
+    IoTCore --> MQTTClient: CONNACK (Return Code: 0x86 - Bad Authentication)
+
+    MQTTClient -> MQTTClient: Trigger certificate renewal process
+    note right #FF6B6B
+    **Recovery**: Request new certificate via fallback channel (SMS)
+    **Impact**: Vehicle offline until renewal (30-60 min)
+    **Severity**: HIGH - Remote commands unavailable
+    **Detection**: Certificate expiry monitor (7-day warning)
+    end note
+
+    MQTTClient -> SNS: ALERT: Certificate renewal required for {vehicle_id}
+
+else #FAILURE_COLOR Network Timeout (>30s)
+    MQTTClient -> MQTTClient: Retry with exponential backoff
+    note right #4ECDC4
+    **Retry Policy**:
+    - Attempt 1: Wait 2s
+    - Attempt 2: Wait 4s
+    - Attempt 3: Wait 8s
+    - Max Attempts: 5
+    - Max Backoff: 32s
+    end note
+
+    loop Retry up to 5 times
+        MQTTClient -> IoTCore: CONNECT (retry)
+        alt Connection Successful
+            IoTCore --> MQTTClient: CONNACK
+        else All Retries Failed
+            MQTTClient -> MQTTClient: Store telemetry locally (vehicle buffer)
+            MQTTClient -> CloudWatch: Log connection failure
+            note right #FF6B6B
+            **Fallback**: Store up to 1000 messages locally
+            **Impact**: Delayed telemetry delivery
+            **Alert**: Network connectivity issue
+            end note
+        end
+    end
+
+else #FAILURE_COLOR Rate Limit Exceeded (AWS IoT)
+    IoTCore -> CloudWatch: WARN: Connection rate limit exceeded
+    IoTCore --> MQTTClient: CONNACK (Return Code: 0x97 - Quota Exceeded)
+
+    note right #FFD93D
+    **AWS IoT Core Limits**:
+    - 500 connections/sec per account
+    - 100 subscriptions per connection
+    - Mitigation: Implement connection pooling
+    end note
+
+    MQTTClient -> MQTTClient: Wait for rate limit window reset (60s)
+end
+
+deactivate IoTCore
+deactivate MQTTClient
+
+note over ECU, CloudWatch
+**FMEA: Connection Establishment Phase**
+
+**Critical Failure Modes**:
+1. Certificate Expiry (Severity: HIGH, RPN: 8)
+2. Network Timeout (Severity: MEDIUM, RPN: 30)
+3. Rate Limiting (Severity: LOW, RPN: 6)
+
+**Mitigation**: Auto-renewal, exponential backoff, local buffering
+**See also**: 01b-telemetry-publishing.puml for message publishing flow
+end note
+
+@enduml

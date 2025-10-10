@@ -1,0 +1,344 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define CRITICAL_COLOR #FF4757
+
+title OTA Update Part 3C: Installation, Verification, and Rollback
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+
+' Participants
+participant "Update Agent\n[A/B Partitions]" as UpdateAgent #LightGreen
+database "Vehicle Storage\n[Partition A/B]" as Storage #LightGray
+participant "Diagnostics\n[Health Checks]" as Diagnostics #LightSalmon
+participant "MQTT Client" as MQTT #LightBlue
+queue "AWS IoT Core" as IoTCore #LightCyan
+participant "OTA Service" as OTAService #LightGreen
+database "DynamoDB" as DynamoDB #LightGray
+participant "Monitoring" as Monitor #Orange
+actor "On-Call Engineer" as Engineer #Red
+
+note over UpdateAgent, Monitor
+**Prerequisite**: Update downloaded and validated (see 03b-ota-download.puml)
+**Installation Method**: A/B partitioning with automatic rollback
+**Estimated Time**: 10 minutes (600 seconds)
+end note
+
+== Phase 3: Installation and Verification ==
+
+UpdateAgent -> UpdateAgent: Schedule installation
+activate UpdateAgent
+
+UpdateAgent -> Diagnostics: Wait for optimal window
+activate Diagnostics
+Diagnostics --> UpdateAgent: Ignition off, parked, battery 85%
+deactivate Diagnostics
+
+UpdateAgent -> IoTCore: Report installation started
+activate IoTCore
+IoTCore -> OTAService: Deliver install start
+OTAService -> DynamoDB: Update status = INSTALLING
+deactivate IoTCore
+
+' Pre-installation checks
+UpdateAgent -> Diagnostics: Run pre-install checks
+activate Diagnostics
+
+alt No Critical DTC
+    Diagnostics --> UpdateAgent: Pre-install checks passed ✓
+    deactivate Diagnostics
+
+    UpdateAgent -> Storage: Identify target partition (Install to B)
+    activate Storage
+
+    alt Partition B Available
+        Storage --> UpdateAgent: Partition B available
+
+else Partition B Not Available
+        Storage --> UpdateAgent: ERROR: Partition B corrupted
+        deactivate Storage
+        note right #FF4757
+        **FMEA: A/B Partition Not Available**
+        Severity: 9, RPN: 9
+        CRITICAL: Vehicle may need factory reset
+        end note
+    end
+
+else Critical DTC Found
+    Diagnostics --> UpdateAgent: FAILED: Critical DTC P0601
+    deactivate Diagnostics
+    UpdateAgent -> IoTCore: Report failure
+    note right #FF6B6B
+    **FMEA: Critical DTC Blocks Installation**
+    Severity: 7, RPN: 14
+    Action: Vehicle requires service
+    end note
+end
+
+Storage --> UpdateAgent: Partition B available (continuing from success path)
+deactivate Storage
+
+UpdateAgent -> IoTCore: Report progress 10% (backup creation)
+UpdateAgent -> Storage: Create backup of Partition A metadata
+activate Storage
+Storage --> UpdateAgent: Backup created
+deactivate Storage
+
+UpdateAgent -> IoTCore: Report progress 20% (extraction)
+UpdateAgent -> Storage: Extract package to Partition B
+activate Storage
+
+alt Extraction Success
+    Storage --> UpdateAgent: Extraction complete
+else Extraction Failed
+    Storage --> UpdateAgent: ERROR: Extraction failed
+    deactivate Storage
+    note right #FF6B6B
+    **FMEA: Package Extraction Failure**
+    Severity: 6, RPN: 24
+    Mitigation: Retry download
+    end note
+end
+
+Storage --> UpdateAgent: Extraction complete (continuing from success path)
+deactivate Storage
+
+UpdateAgent -> IoTCore: Report progress 40% (applying update)
+UpdateAgent -> Storage: Write firmware to Partition B
+activate Storage
+
+alt Flash Write Success
+    Storage --> UpdateAgent: Firmware written successfully
+else Flash Write Failure
+    Storage --> UpdateAgent: ERROR: Flash write failed
+    deactivate Storage
+    note right #FF4757
+    **FMEA: Flash Memory Write Failure**
+    Severity: 8, RPN: 16
+    Mitigation: Partition A still bootable
+    Action: Vehicle requires storage service
+    end note
+end
+
+Storage --> UpdateAgent: Firmware written successfully (continuing from success path)
+deactivate Storage
+
+UpdateAgent -> IoTCore: Report progress 70%
+UpdateAgent -> IoTCore: Report progress 80% (bootloader update)
+
+UpdateAgent -> Storage: Update boot flags
+activate Storage
+note right
+{active_partition: B,
+fallback_partition: A,
+boot_attempts: 0,
+max_attempts: 3}
+end note
+Storage --> UpdateAgent: Boot flags updated
+deactivate Storage
+
+UpdateAgent -> IoTCore: Report progress 90% (rebooting)
+OTAService -> DynamoDB: Update status = REBOOTING
+
+UpdateAgent -> UpdateAgent: Initiate system reboot
+
+note over UpdateAgent #FFD93D
+**SYSTEM REBOOT**
+Bootloader switches to Partition B
+Vehicle offline for ~60 seconds
+end note
+
+note right
+**Automatic Rollback Detection**:
+- Track successful boot attempts
+- If 3 consecutive failed boots → rollback to A
+- Watchdog timer: 120 seconds per boot
+- Prevents boot loops from bad firmware
+end note
+
+alt Boot Successful on New Firmware
+    ' System boots successfully on new partition
+    UpdateAgent -> UpdateAgent: Boot from Partition B (version 2.5.1)
+    UpdateAgent -> UpdateAgent: Check boot_attempts counter (Attempt 1 of 3)
+    UpdateAgent -> UpdateAgent: Boot successful on Partition B ✓ (v2.5.1)
+
+else Boot Failure (New Firmware Crashes)
+    ' Boot attempt fails
+    UpdateAgent -> UpdateAgent: Watchdog timeout (boot failed)
+    UpdateAgent -> UpdateAgent: Increment boot_attempts = 1
+    UpdateAgent -> UpdateAgent: Reboot and retry
+
+    ' Second attempt
+    UpdateAgent -> UpdateAgent: Boot from Partition B (Attempt 2)
+    UpdateAgent -> UpdateAgent: Watchdog timeout (failed again)
+    UpdateAgent -> UpdateAgent: Increment boot_attempts = 2
+
+    ' Third attempt
+    UpdateAgent -> UpdateAgent: Boot from Partition B (Attempt 3)
+    UpdateAgent -> UpdateAgent: Watchdog timeout (3rd failure)
+    UpdateAgent -> UpdateAgent: boot_attempts = 3 (MAX EXCEEDED)
+
+    UpdateAgent -> Storage: Automatic rollback triggered
+    activate Storage
+    Storage --> UpdateAgent: Boot flags reverted to Partition A
+    deactivate Storage
+
+    UpdateAgent -> UpdateAgent: Reboot from Partition A (old firmware)
+    UpdateAgent -> UpdateAgent: Boot successful (Partition A, v2.0.0)
+
+    UpdateAgent -> MQTT: Report rollback
+    activate MQTT
+    MQTT -> IoTCore: PUBLISH rollback notification
+    activate IoTCore
+    IoTCore -> OTAService: Deliver rollback notification
+    OTAService -> DynamoDB: Update status = ROLLED_BACK
+    OTAService -> Monitor: CRITICAL: Update caused boot failures
+    deactivate IoTCore
+    deactivate MQTT
+
+    OTAService -> OTAService: Check campaign failure threshold (5 of 10)
+
+    alt Campaign Failure Threshold Exceeded
+        OTAService -> OTAService: Auto-pause campaign
+        OTAService -> DynamoDB: Update campaign status = PAUSED
+        OTAService -> Monitor: ALERT: Campaign auto-paused
+        activate Monitor
+        Monitor -> Engineer: PagerDuty: OTA campaign causing rollbacks
+        activate Engineer
+        note over Engineer #FF4757
+        **Manual Investigation Required**:
+        1. Review update package for defects
+        2. Analyze rollback logs
+        3. Identify root cause
+        4. Decide: Fix and resume OR cancel
+        end note
+        deactivate Engineer
+        deactivate Monitor
+    end
+
+    note over UpdateAgent, Storage #FF4757
+    **FMEA: Boot Failure After Update**
+    Severity: 9 (high impact, safe rollback prevents bricking)
+    RPN: 54 (Medium-High)
+    Mitigation: A/B partitioning, automatic rollback
+    Recovery: Vehicle remains operational on old firmware
+    end note
+end
+
+== Post-Boot Verification (Success Path) ==
+
+UpdateAgent -> UpdateAgent: Continuing from successful boot on Partition B ✓
+
+UpdateAgent -> MQTT: Reconnect to AWS IoT Core
+activate MQTT
+MQTT -> IoTCore: CONNECT
+activate IoTCore
+IoTCore --> MQTT: CONNACK
+deactivate IoTCore
+deactivate MQTT
+
+UpdateAgent -> IoTCore: Report progress 95% (post-install verification)
+
+' Post-installation verification
+UpdateAgent -> Diagnostics: Run post-install verification tests
+activate Diagnostics
+
+note right
+**Post-Install Verification Tests**:
+1. CAN bus communication check
+2. ECU firmware version validation
+3. DTC scan (no new critical errors)
+4. Sensor connectivity test
+5. Network connectivity test
+6. Feature smoke tests
+end note
+
+alt Verification Test Failed
+    Diagnostics --> UpdateAgent: FAILED: Test "CAN_BUS_COMMUNICATION" failed
+    deactivate Diagnostics
+
+    UpdateAgent -> Storage: Rollback to Partition A
+    activate Storage
+    Storage --> UpdateAgent: Boot flags reverted
+    deactivate Storage
+
+    UpdateAgent -> UpdateAgent: Reboot to Partition A
+
+    UpdateAgent -> IoTCore: Report rollback
+    note right #FF6B6B
+    **FMEA: Post-Install Verification Failure**
+    Severity: 8, RPN: 16
+    Recovery: Vehicle operational on old firmware
+    end note
+end
+
+' Continue with success scenario
+
+Diagnostics --> UpdateAgent: All tests passed ✓ (6/6 passed)
+deactivate Diagnostics
+
+UpdateAgent -> Storage: Mark Partition B as stable
+activate Storage
+Storage --> UpdateAgent: Partition B marked stable
+deactivate Storage
+
+UpdateAgent -> IoTCore: Report installation complete {status: SUCCESS}
+activate IoTCore
+IoTCore -> OTAService: Deliver completion
+OTAService -> DynamoDB: Update status = COMPLETED
+OTAService -> Monitor: Metric: Update successful (duration: 620s)
+deactivate IoTCore
+
+OTAService -> OTAService: Check campaign progress (Canary: 98/100 success)
+
+alt Canary Success Rate >= 95%
+    OTAService -> OTAService: Canary validation passed ✓
+    OTAService -> OTAService: Proceed with full rollout (5000 vehicles)
+    OTAService -> DynamoDB: Update campaign status = ACTIVE, phase = FULL_ROLLOUT
+
+    note over OTAService #6BCF7F
+    **Canary Deployment Successful**
+    Success rate: 98% (acceptable)
+    Proceeding with full fleet rollout
+    end note
+
+else Canary Failure Rate > 5%
+    OTAService -> OTAService: Canary validation FAILED (85% success)
+    OTAService -> DynamoDB: Update campaign status = PAUSED
+    OTAService -> Monitor: ALERT: Campaign halted due to canary failures
+    activate Monitor
+    Monitor -> Engineer: PagerDuty: Campaign halted
+    deactivate Monitor
+
+    note over OTAService #FF6B6B
+    **FMEA: Canary Deployment Failure**
+    Severity: 7, RPN: 21 (Medium)
+    Mitigation: Only 100 vehicles affected
+    Impact: Campaign halted before fleet-wide rollout
+    end note
+end
+
+deactivate UpdateAgent
+
+note over UpdateAgent, Monitor
+**Phase 3 Complete: Update Installed and Verified**
+
+**Total Duration**: ~25 minutes
+- Notification: 5s
+- Download: 14 minutes (850s)
+- Installation: 10 minutes (620s)
+- Verification: 12s
+
+**Success Criteria**:
+- Vehicle running firmware 2.5.1
+- A/B partition preserved for future updates
+- Rollback capability maintained
+- All verification tests passed
+
+**See also**:
+- 03a-ota-notification.puml for campaign creation
+- 03b-ota-download.puml for download phase
+end note
+
+@enduml

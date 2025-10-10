@@ -1,0 +1,305 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+
+title Diagnostics Flow Part 4B: ML Analysis and Service Recommendations
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+
+' Participants
+queue "AWS IoT Core" as IoTCore #LightPink
+participant "Lambda: DTC Processor\n[Timeout: 30s]" as DTCProcessor #LightYellow
+database "DynamoDB: DTC History\n[TTL: 5 years]" as DTCHistory #LightGray
+participant "ML Service\n[SageMaker]\n[Model: v2.3]" as MLService #Orange
+participant "Service Recommendation\n[Business Rules]" as ServiceReco #LightGreen
+participant "Warranty Service" as Warranty #LightBlue
+queue "Dead Letter Queue" as DLQ #FF6B6B
+participant "Monitoring" as Monitor #Orange
+
+note over IoTCore, Monitor
+**Prerequisite**: DTC report published to MQTT (see 04a-dtc-detection.puml)
+**Processing Timeout**: 30 seconds
+**ML Model**: Predictive Maintenance v2.3 (XGBoost)
+end note
+
+== Cloud Processing Phase (Lambda DTC Processor) ==
+
+IoTCore -> DTCProcessor: Invoke Lambda (Event: MQTT message)
+activate DTCProcessor
+
+DTCProcessor -> DTCProcessor: Deserialize protobuf
+
+alt Protobuf Deserialization Success
+    DTCProcessor -> DTCProcessor: Extract DTC details
+else Protobuf Deserialization Failure
+    DTCProcessor -> Monitor: ERROR: Invalid protobuf format
+    DTCProcessor -> DLQ: Send to DLQ for manual review
+    note right #FF6B6B
+    **FMEA: Protobuf Parsing Failure**
+    Severity: 5, RPN: 5
+    Mitigation: DLQ + manual replay
+    end note
+end
+
+' Continue with success path
+DTCProcessor -> DTCProcessor: Extract DTC details (continuing from success)
+note right
+- Code: P0171
+- Severity: MEDIUM
+- Category: POWERTRAIN
+- Freeze Frame: {...}
+end note
+
+== DTC History Storage (DynamoDB) ==
+
+DTCProcessor -> DTCHistory: PutItem {vehicle_id, dtc_code, timestamp}
+activate DTCHistory
+
+alt DynamoDB Write Success
+    DTCHistory --> DTCProcessor: SUCCESS (Latency: 12ms)
+
+    note right #6BCF7F
+    **DynamoDB Schema**:
+    - PK: vehicle_id
+    - SK: dtc_code#timestamp
+    - GSI: dtc_code (query by code)
+    - TTL: 5 years (compliance)
+    - Performance: P50: 8ms, P99: 45ms
+    end note
+
+else DynamoDB Write Failure (Throttling)
+    DTCHistory --> DTCProcessor: ERROR: Throttling
+    DTCProcessor -> DTCProcessor: Retry with exponential backoff
+
+    alt All Retries Failed
+        DTCProcessor -> Monitor: CRITICAL: DynamoDB write failure
+        DTCProcessor -> DLQ: Send to DLQ for replay
+        note right #FF6B6B
+        **FMEA: DynamoDB Persistent Failure**
+        Severity: 6, RPN: 24
+        Mitigation: Auto-scaling, DLQ replay
+        end note
+        deactivate DTCHistory
+        deactivate DTCProcessor
+    end
+end
+
+' Continue with success path
+
+deactivate DTCHistory
+
+== DTC Historical Analysis (Correlation) ==
+
+DTCProcessor -> DTCHistory: QUERY last 30 days of DTCs
+activate DTCHistory
+DTCHistory --> DTCProcessor: Result: 7 DTCs
+deactivate DTCHistory
+note right
+[P0171 (3x), P0174 (2x),
+C0040 (1x), P0420 (1x)]
+end note
+
+DTCProcessor -> DTCProcessor: Analyze DTC patterns
+note right
+**Pattern Analysis**:
+- P0171 recurring (3x in 10 days)
+- P0174 related (same bank)
+- Pattern: Fuel trim issue
+- Likely cause: MAF sensor
+end note
+
+== Predictive Maintenance (ML Inference) ==
+
+DTCProcessor -> MLService: POST /predict
+activate MLService
+note right
+{vehicle_id, dtc_code,
+freeze_frame, history}
+end note
+
+alt ML Inference Success
+    MLService -> MLService: Load model (SageMaker endpoint: ml.m5.xlarge)
+
+    MLService -> MLService: Feature engineering
+    note right
+    - DTC frequency: 3/30 days = 0.1
+    - Mileage delta: 500 km
+    - Freeze frame anomalies: fuel trim +15%
+    - Historical patterns: P0171 + P0174 = MAF
+    end note
+
+    MLService -> MLService: Run inference (XGBoost, 120ms)
+
+    MLService --> DTCProcessor: Prediction
+    deactivate MLService
+    note right
+    {
+      failure_probability: 78%,
+      affected_component: "Mass Airflow Sensor",
+      remaining_life_km: 350,
+      remaining_days: 14,
+      confidence: 0.92
+    }
+    end note
+
+    note right #6BCF7F
+    **ML Model Performance**:
+    - Accuracy: 89%
+    - Precision: 87%, Recall: 91%
+    - F1 Score: 0.89
+    - Training data: 2M DTCs
+    end note
+
+else ML Inference Timeout (>10s)
+    MLService --> DTCProcessor: ERROR: Timeout (504)
+    DTCProcessor -> DTCProcessor: Use fallback: Rule-based prediction
+    DTCProcessor -> Monitor: WARNING: ML inference timeout
+
+    note right #FFD93D
+    **FMEA: ML Inference Timeout**
+    Severity: 4, RPN: 24
+    Mitigation: Rule-based fallback (80% accuracy)
+    end note
+
+    DTCProcessor -> DTCProcessor: Fallback prediction
+    note right
+    {component: "Fuel System",
+    urgency: MEDIUM,
+    confidence: 0.65}
+    end note
+
+else ML Service Unavailable
+    MLService --> DTCProcessor: ERROR: 503 Service Unavailable
+    DTCProcessor -> Monitor: CRITICAL: ML service outage
+    DTCProcessor -> DTCProcessor: Use rule-based prediction
+
+    note right #FF6B6B
+    **FMEA: ML Service Outage**
+    Severity: 5, RPN: 10
+    Mitigation: Rule-based backup
+    end note
+end
+
+== Service Recommendation Engine ==
+
+DTCProcessor -> ServiceReco: GET /recommend
+activate ServiceReco
+note right
+{dtc_code, prediction,
+vehicle_model, mileage}
+end note
+
+ServiceReco -> ServiceReco: Load business rules
+note right
+**Recommendation Database**:
+- DTC: P0171 → MAF sensor replacement
+- Labor: 0.5 hours
+- Part cost: $150-$300
+- Urgency: Service within 500 km
+- 5000+ DTC → Service mappings
+end note
+
+ServiceReco -> ServiceReco: Find authorized dealers (25 km radius)
+note right
+Vehicle location: 37.7749°N, 122.4194°W
+end note
+
+ServiceReco --> DTCProcessor: Recommendations
+deactivate ServiceReco
+note right
+[{
+  service: "Replace Mass Airflow Sensor",
+  part_number: "OEM-MAF-2023-X",
+  labor_hours: 0.5,
+  estimated_cost: $225,
+  urgency: MEDIUM,
+  dealers: [dealer_1, dealer_2, dealer_3]
+}]
+end note
+
+note right #6BCF7F
+**Recommendation Quality**:
+- Match rate: 94%
+- Customer acceptance: 67%
+- Revenue per DTC: $180
+end note
+
+== Warranty Claim Integration ==
+
+DTCProcessor -> Warranty: POST /validate
+activate Warranty
+note right
+{vehicle_id, dtc_code,
+mileage, warranty_number}
+end note
+
+alt Warranty Active and Covers DTC
+    Warranty --> DTCProcessor: Covered
+    deactivate Warranty
+    note right
+    {covered: true,
+    warranty_type: "Powertrain",
+    expires: "2026-05-15",
+    claim_id: "WC-2025-8821",
+    coverage_percent: 100}
+    end note
+
+    DTCProcessor -> DTCProcessor: Include in notification: "Repair covered under warranty (100%)"
+
+    note right #6BCF7F
+    **Warranty Validation**:
+    - Real-time coverage check
+    - Pre-approved claim
+    - Zero customer cost
+    end note
+
+else Warranty Expired or Not Covered
+    Warranty --> DTCProcessor: Not covered
+    deactivate Warranty
+    note right
+    {covered: false,
+    reason: "Wear and tear item",
+    customer_cost_estimate: $225}
+    end note
+
+else Warranty Service Timeout (>15s)
+    Warranty --> DTCProcessor: ERROR: Timeout
+    DTCProcessor -> DTCProcessor: Skip warranty check
+    DTCProcessor -> Monitor: WARNING: Warranty timeout
+
+    note right #FFD93D
+    **FMEA: Warranty Service Timeout**
+    Severity: 3, RPN: 18
+    Mitigation: Async retry, cache results
+    end note
+end
+
+DTCProcessor -> Monitor: INFO: DTC processing complete (duration: 2.8s)
+
+DTCProcessor -> DTCHistory: UPDATE notification_sent=true
+activate DTCHistory
+DTCHistory --> DTCProcessor: Updated
+deactivate DTCHistory
+
+deactivate DTCProcessor
+
+note over IoTCore, Monitor
+**Phase 4B Complete: ML Analysis and Recommendations**
+
+**Success Criteria**:
+- DTC stored in history (5-year retention)
+- Historical pattern analysis complete
+- ML prediction generated (78% failure probability)
+- Service recommendation created ($225 estimated)
+- Warranty status validated (covered 100%)
+
+**Processing Metrics**:
+- Total duration: 2.8s
+- ML inference: 120ms
+- DynamoDB operations: 3 (total: 36ms)
+
+**Next**: See 04c-customer-notification.puml for multi-channel notifications
+end note
+
+@enduml

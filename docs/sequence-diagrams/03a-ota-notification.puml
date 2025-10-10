@@ -1,0 +1,198 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define RETRY_COLOR #4ECDC4
+!define CRITICAL_COLOR #FF4757
+
+title OTA Update Part 3A: Campaign Creation and Notification
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+
+' Participants
+actor "Fleet Manager" as Manager #LightBlue
+participant "OTA Service\n[Campaign Orchestration]" as OTAService #LightGreen
+database "DynamoDB\n[Update Tracking]" as DynamoDB #LightGray
+participant "S3\n[Update Repository]" as S3 #LightYellow
+participant "HSM Signing\n[AWS CloudHSM]" as HSM #LightPink
+queue "AWS IoT Core\n[MQTT 5.0]" as IoTCore #LightCyan
+participant "MQTT Client\n[Vehicle ECU]" as MQTT #LightBlue
+queue "DLQ\n[Failed Updates]" as DLQ #FF6B6B
+participant "Monitoring" as Monitor #Orange
+
+== Phase 1: OTA Update Campaign Creation ==
+
+Manager -> OTAService: Create OTA Campaign
+activate OTAService
+note right
+{update_id: "ota-2025-001",
+version: "2.5.1",
+type: SECURITY_PATCH,
+priority: CRITICAL,
+target_filter: "model='Accord' AND year>=2023",
+rollout_strategy: CANARY,
+canary_size: 100}
+end note
+
+OTAService -> OTAService: Validate campaign parameters
+
+alt Validation Success
+    OTAService -> S3: Verify package exists
+    activate S3
+    S3 --> OTAService: 200 OK {size: 52428800, etag: "abc123"}
+    deactivate S3
+
+    OTAService -> HSM: Sign update metadata
+    activate HSM
+    HSM --> OTAService: Digital Signature (ECC P-256)
+    deactivate HSM
+
+    OTAService -> DynamoDB: Create campaign record
+    activate DynamoDB
+    DynamoDB --> OTAService: Item created
+    deactivate DynamoDB
+
+    OTAService -> DynamoDB: Query vehicles matching filter
+    activate DynamoDB
+    DynamoDB --> OTAService: 5000 vehicles matched
+    deactivate DynamoDB
+
+    OTAService -> OTAService: Select canary group (First 100 vehicles)
+
+else Validation Failed
+    OTAService --> Manager: 400 Bad Request {error: "Invalid target filter"}
+    note over Manager, OTAService #FF6B6B
+    **FMEA: Invalid Campaign Configuration**
+    Severity: 3 (blocks deployment, no vehicle impact)
+    RPN: 6 (Low)
+    end note
+
+else Package Not Found
+    OTAService -> S3: Verify package exists
+    activate S3
+    S3 --> OTAService: 404 Not Found
+    deactivate S3
+    OTAService --> Manager: 400 Bad Request
+
+else HSM Unavailable
+    OTAService -> HSM: Sign update metadata
+    activate HSM
+    HSM --X OTAService: Timeout (>5s)
+    deactivate HSM
+    OTAService -> Monitor: CRITICAL: HSM signing service down
+    OTAService --> Manager: 503 Service Unavailable
+    note over OTAService, HSM #FF4757
+    **FMEA: HSM Signing Failure**
+    Severity: 9 (blocks ALL updates)
+    RPN: 9 (Low-Medium)
+    Mitigation: Multi-region HSM, health checks
+    end note
+
+else DynamoDB Write Failure
+    OTAService -> DynamoDB: Create campaign record
+    activate DynamoDB
+    DynamoDB --> OTAService: 500 Internal Server Error
+    deactivate DynamoDB
+    OTAService -> OTAService: Retry with exponential backoff
+    OTAService --> Manager: 503 Service Unavailable
+end
+
+== Phase 2: Update Notification to Vehicle ==
+
+OTAService -> DynamoDB: Create update_status record
+activate DynamoDB
+DynamoDB --> OTAService: Item created
+deactivate DynamoDB
+
+OTAService -> S3: Generate presigned URL (expires: 1 hour)
+activate S3
+S3 --> OTAService: Presigned URL
+deactivate S3
+
+OTAService -> IoTCore: PUBLISH OTA notification
+activate IoTCore
+note right
+Topic: v2c/v1/{region}/{vehicle_id}/ota/available
+QoS: 2 (Exactly Once - Safety Critical)
+Message Expiry: 86400s (24 hours)
+Payload: {
+  update_id, version: "2.5.1",
+  type: SECURITY_PATCH,
+  priority: CRITICAL,
+  size_bytes: 52428800,
+  min_battery_level: 30,
+  signature, metadata
+}
+end note
+
+alt MQTT Publish Failure
+    IoTCore --X OTAService: Timeout (no PUBREC)
+    OTAService -> OTAService: Retry MQTT publish (3 attempts)
+
+    alt All Retries Failed
+        deactivate IoTCore
+        OTAService -> DLQ: Send notification to DLQ
+        OTAService -> Monitor: ALERT: MQTT broker unavailable
+
+        note over OTAService, IoTCore #FF4757
+        **FMEA: MQTT Broker Failure**
+        Severity: 9 (affects ALL vehicles)
+        RPN: 9 (Low-Medium)
+        Mitigation: Multi-region IoT Core
+        Recovery: Replay from DLQ after restoration
+        end note
+    end
+end
+
+IoTCore --> OTAService: PUBREC (QoS 2 phase 1)
+OTAService -> IoTCore: PUBREL (QoS 2 phase 2)
+IoTCore --> OTAService: PUBCOMP (QoS 2 complete)
+
+note right
+**QoS 2 Exactly Once Guarantee**
+- Prevents duplicate installations
+- Critical for safety-related updates
+- 4-way handshake protocol
+end note
+
+IoTCore -> MQTT: Forward notification to vehicle
+activate MQTT
+
+alt Vehicle Offline (Persistent Session)
+    MQTT --X MQTT: Vehicle not connected
+    IoTCore -> IoTCore: Queue message in persistent session
+    note right
+    **MQTT 5.0 Persistent Session**:
+    - cleanSession: false
+    - sessionExpiryInterval: 3600s
+    - Messages queued up to 1 hour
+    - Delivered on next connect
+    end note
+
+    MQTT -> IoTCore: CONNECT (vehicle reconnects later)
+    IoTCore -> MQTT: CONNACK {sessionPresent: true}
+    IoTCore -> MQTT: Deliver queued message
+end
+
+MQTT --> IoTCore: PUBREC
+IoTCore -> MQTT: PUBREL
+MQTT --> IoTCore: PUBCOMP
+deactivate IoTCore
+
+deactivate OTAService
+
+note over Manager, MQTT
+**Phase 1 Complete: Update Campaign Created and Notified**
+
+**Success Criteria**:
+- Campaign validated and created
+- Update package verified
+- Metadata digitally signed
+- Notification delivered to vehicle (QoS 2)
+
+**Next**: See 03b-ota-download.puml for download phase
+end note
+
+deactivate MQTT
+
+@enduml

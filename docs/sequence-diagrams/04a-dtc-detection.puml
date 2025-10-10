@@ -1,0 +1,274 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define RETRY_COLOR #4ECDC4
+
+title Diagnostics Flow Part 4A: DTC Detection and Reporting
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+
+' Participants
+participant "Vehicle ECU\n[Engine Control]" as ECU #LightBlue
+participant "OBD-II Interface\n[ISO 15765-4]" as OBD #LightCyan
+participant "Diagnostic Agent\n[In-Vehicle Gateway]" as DiagAgent #LightGreen
+participant "MQTT Client\n[QoS: 0,1,2]" as MQTTClient #LightSalmon
+queue "AWS IoT Core\n[MQTT 5.0]" as IoTCore #LightPink
+participant "Monitoring" as Monitor #Orange
+
+== DTC Detection Phase (On-Board Diagnostics) ==
+
+note over ECU
+**OBD-II Continuous Monitoring**
+- 500+ PIDs monitored per second
+- 4 monitoring cycles for DTC confirmation
+- SAE J1979 standard compliance
+end note
+
+ECU -> ECU: Detect fault condition
+activate ECU
+note right
+Mass Airflow Sensor out of range
+end note
+
+ECU -> ECU: Run diagnostic test (3 drive cycles)
+note right
+**DTC Confirmation Process**:
+- Pending: 1st occurrence
+- Confirmed: 2nd occurrence
+- Active: 3rd occurrence
+MTBF: 50,000 hours
+end note
+
+alt DTC Confirmed (Active)
+    ECU -> ECU: Set DTC Active status\nCode: P0171 (System Too Lean Bank 1)
+else DTC Pending (Not Confirmed)
+    ECU -> ECU: Store as PENDING status
+    note right
+    No cloud reporting until confirmed
+    Prevents false positives
+    end note
+end
+
+' Continue with confirmed DTC processing
+ECU -> ECU: Set DTC Active status\nCode: P0171 (continuing from confirmed path)
+ECU -> ECU: Classify severity and category
+
+note right #FFD93D
+**Severity Classification**:
+- INFO: Informational
+- LOW: Service recommended (< 1000 km)
+- MEDIUM: Service soon (< 500 km)
+- HIGH: Service immediately (< 100 km)
+- CRITICAL: Do not drive (tow required)
+
+**Category**: P0xxx (Powertrain - SAE)
+end note
+
+ECU -> ECU: Capture freeze frame data
+
+alt Freeze Frame Capture Failure
+    ECU -> ECU: Retry capture (3 attempts)
+    alt All Retries Failed
+        ECU -> ECU: Store DTC without freeze frame
+        ECU -> Monitor: ERROR: Freeze frame capture failed
+        note right #FF6B6B
+        **FMEA: Missing Freeze Frame**
+        Severity: 6, RPN: 84
+        Mitigation: Request snapshot from cloud
+        end note
+    end
+end
+
+ECU -> ECU: Snapshot vehicle state
+note right #6BCF7F
+**Freeze Frame Data**:
+- Engine RPM: 2200
+- Speed: 80 km/h
+- Throttle: 42%
+- Coolant: 92°C
+- MAF: 4.2 g/s
+- O2 Sensor: 0.45V
+- Fuel Trim: +15%
+- Timestamp: EPOCH ms
+- Mileage: 125,430 km
+end note
+
+deactivate ECU
+
+== DTC Reporting to Diagnostic Agent ==
+
+ECU -> OBD: Notify new DTC available (CAN Bus: 0x7DF)
+activate OBD
+
+OBD -> DiagAgent: Poll DTC data (Mode $03: Request Stored DTCs)
+activate DiagAgent
+
+alt OBD-II Communication Success
+    DiagAgent -> OBD: Send request (PID: $03)
+    OBD -> ECU: Read DTC(s) from ECU memory
+
+    ECU --> OBD: DTC data packet
+    note right
+    {code: P0171,
+    occurrence: 3,
+    first: 2025-10-08,
+    last: 2025-10-10}
+    end note
+
+    OBD --> DiagAgent: DTC Report
+    deactivate OBD
+    note right
+    {code: P0171,
+    severity: MEDIUM,
+    category: POWERTRAIN}
+    end note
+
+else OBD-II Timeout (>5s)
+    DiagAgent -> DiagAgent: Retry with exponential backoff (Attempt 1/3)
+
+    alt All Retries Failed
+        DiagAgent -> Monitor: CRITICAL: OBD-II communication failure
+        note right #FF6B6B
+        **FMEA: OBD-II Communication Failure**
+        Severity: 8, RPN: 32
+        Mitigation: Cache locally, retry on next cycle
+        end note
+        DiagAgent -> DiagAgent: Cache DTC locally
+        deactivate DiagAgent
+    end
+end
+
+' Continue with success path
+
+deactivate ECU
+
+== Duplicate DTC Suppression (Idempotency) ==
+
+DiagAgent -> DiagAgent: Check deduplication cache\n(key: dtc_code + first_occurrence)
+
+alt DTC Already Reported (Duplicate)
+    DiagAgent -> DiagAgent: Compare timestamps and occurrence count
+
+    alt Occurrence Count Increased
+        DiagAgent -> DiagAgent: Update occurrence count only
+        note right #6BCF7F
+        **Smart Deduplication**:
+        - Same DTC, new occurrence
+        - Update count: 3 → 4
+        - No full republish
+        Bandwidth savings: 95%
+        end note
+
+    else Same Occurrence, No Changes
+        DiagAgent -> DiagAgent: Suppress duplicate report
+        DiagAgent -> Monitor: DEBUG: Duplicate suppressed
+        note right #6BCF7F
+        **Duplicate Prevention**:
+        - Reduces MQTT messages by 80%
+        - Cache TTL: 24 hours
+        end note
+        deactivate DiagAgent
+    end
+
+else New DTC (Not in Cache)
+    DiagAgent -> DiagAgent: Add to cache with TTL 24h
+    note right
+    Cache entry: {
+      dtc_code: "P0171",
+      first_occurrence: 1728432000,
+      last_reported: 1728518400,
+      report_count: 1
+    }
+    end note
+end
+
+== MQTT Publishing Phase ==
+
+DiagAgent -> DiagAgent: Build DTCReport protobuf message
+note right
+**DTCReport Structure**:
+- report_id: UUID
+- timestamp: EPOCH ms
+- report_type: ACTIVE_DTCS
+- dtcs: [DiagnosticTroubleCode]
+- source_ecu: "ECM-001"
+- mileage_km: 125430
+end note
+
+DiagAgent -> MQTTClient: Publish DTCReport (QoS: 1)
+activate MQTTClient
+
+MQTTClient -> MQTTClient: Serialize to protobuf + ZSTD compression
+note right
+**Message Optimization**:
+- JSON: 2.4 KB
+- Protobuf: 1.2 KB (50% reduction)
+- ZSTD: 842 bytes (65% total savings)
+end note
+
+MQTTClient -> IoTCore: PUBLISH\nTopic: v2c/v1/{region}/{vehicle_id}/diagnostics/dtc\nQoS: 1
+activate IoTCore
+
+alt MQTT Publish Success
+    IoTCore -> MQTTClient: PUBACK (packet_id: 42)
+    deactivate MQTTClient
+    DiagAgent -> Monitor: INFO: DTC report published
+
+    note right #6BCF7F
+    **QoS 1 Guarantee**:
+    - At-least-once delivery
+    - Success rate: 99.97%
+    end note
+
+else MQTT Connection Lost
+    MQTTClient -> MQTTClient: Detect connection failure
+    MQTTClient -> MQTTClient: Reconnect with exponential backoff
+
+    alt Reconnect Successful
+        MQTTClient -> IoTCore: Resume session, redeliver
+        IoTCore -> MQTTClient: PUBACK
+        note right #6BCF7F
+        **Connection Recovery**:
+        - Persistent session preserved
+        - No message loss
+        - MTTR: 2-10 seconds
+        end note
+
+    else Reconnect Failed
+        MQTTClient -> DiagAgent: ERROR: Cannot connect
+        DiagAgent -> DiagAgent: Store in local queue (SQLite)
+        note right #FF6B6B
+        **FMEA: Prolonged Connectivity Loss**
+        Severity: 7, RPN: 42
+        Mitigation: Local storage (1000 DTCs max)
+        end note
+    end
+    deactivate MQTTClient
+
+else MQTT Message Too Large
+    IoTCore --> MQTTClient: DISCONNECT (0x95: Packet too large)
+    MQTTClient -> DiagAgent: Split DTCReport into chunks
+    note right #FFD93D
+    **FMEA: Message Size Limit**
+    Severity: 4, RPN: 12
+    Mitigation: Chunking protocol
+    end note
+end
+
+deactivate IoTCore
+deactivate DiagAgent
+
+note over ECU, Monitor
+**Phase 4A Complete: DTC Detected and Reported**
+
+**Success Criteria**:
+- DTC detected and confirmed (3 drive cycles)
+- Freeze frame captured (20+ PIDs)
+- Duplicate suppression working (80% reduction)
+- Published to cloud via MQTT QoS 1
+
+**Next**: See 04b-ml-analysis.puml for ML prediction and severity assessment
+end note
+
+@enduml

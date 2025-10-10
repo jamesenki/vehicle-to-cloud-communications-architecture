@@ -1,0 +1,239 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define RETRY_COLOR #4ECDC4
+
+title OTA Update Part 3B: Update Download with Progress and Resume
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+
+' Participants
+participant "MQTT Client" as MQTT #LightBlue
+participant "Update Agent\n[Vehicle]" as UpdateAgent #LightGreen
+participant "Vehicle HSM/TPM" as VehicleHSM #LightPink
+database "Vehicle Storage\n[Flash Memory]" as Storage #LightGray
+participant "Diagnostics\n[Vehicle]" as Diagnostics #LightSalmon
+participant "S3\n[Update Repository]" as S3 #LightYellow
+queue "AWS IoT Core" as IoTCore #LightCyan
+participant "OTA Service" as OTAService #LightGreen
+database "DynamoDB" as DynamoDB #LightGray
+participant "Monitoring" as Monitor #Orange
+
+note over MQTT, Monitor
+**Prerequisite**: Vehicle received OTA notification (see 03a-ota-notification.puml)
+**Download Method**: HTTP Range requests with resume support
+**Max Download Time**: 3600s (1 hour)
+end note
+
+== Phase 2: Update Acceptance and Download ==
+
+MQTT -> UpdateAgent: Forward OTA notification
+activate UpdateAgent
+
+UpdateAgent -> UpdateAgent: Check for concurrent updates
+
+alt No Concurrent Update
+    UpdateAgent -> VehicleHSM: Verify digital signature
+    activate VehicleHSM
+
+    alt Signature Valid
+        VehicleHSM --> UpdateAgent: SIGNATURE_VALID
+        deactivate VehicleHSM
+
+        UpdateAgent -> UpdateAgent: Check preconditions
+
+        alt Preconditions Met
+            UpdateAgent -> Diagnostics: Get vehicle state
+            activate Diagnostics
+            Diagnostics --> UpdateAgent: {battery: 85%, ignition: false, parked: true}
+            deactivate Diagnostics
+
+            UpdateAgent -> Storage: Check available space
+            activate Storage
+            Storage --> UpdateAgent: Available: 250MB (Required: 100MB)
+            deactivate Storage
+
+            UpdateAgent -> IoTCore: Accept update
+
+        else Insufficient Battery (<30%)
+            UpdateAgent -> IoTCore: Defer update {status: DEFERRED, reason: "INSUFFICIENT_BATTERY"}
+            note right #FFD93D
+            **FMEA: Insufficient Battery**
+            Severity: 6, RPN: 42
+            Mitigation: Wait for charging
+            end note
+
+        else Insufficient Storage
+            UpdateAgent -> Storage: Check available space
+            activate Storage
+            Storage --> UpdateAgent: Available: 30MB (Required: 100MB)
+            deactivate Storage
+            UpdateAgent -> IoTCore: Reject update
+
+        else Vehicle In Use
+            UpdateAgent -> Diagnostics: Get vehicle state
+            activate Diagnostics
+            Diagnostics --> UpdateAgent: {speed: 65 km/h, ignition: true}
+            deactivate Diagnostics
+            UpdateAgent -> IoTCore: Defer update
+        end
+
+    else Signature Verification Failed
+        VehicleHSM --> UpdateAgent: SIGNATURE_INVALID
+        deactivate VehicleHSM
+        UpdateAgent -> IoTCore: Reject update
+        note right #FF4757
+        **FMEA: Signature Verification Failure**
+        Severity: 10 (security vulnerability)
+        RPN: 10 (Medium)
+        CRITICAL: Alert security team
+        end note
+    end
+
+else Concurrent Update in Progress
+    UpdateAgent -> IoTCore: Reject update {status: REJECTED, reason: "Update in progress"}
+    note right #FFD93D
+    **FMEA: Concurrent Update Conflict**
+    Severity: 4, RPN: 12
+    Mitigation: Campaign coordination
+    end note
+end
+
+UpdateAgent -> IoTCore: Accept update (continuing from success path)
+activate IoTCore
+IoTCore -> OTAService: Deliver acceptance
+OTAService -> DynamoDB: Update status = ACCEPTED
+deactivate IoTCore
+
+== Download Phase with Resume Support ==
+
+UpdateAgent -> UpdateAgent: Begin download (chunk size: 1MB, supports resume)
+
+UpdateAgent -> S3: GET Range: bytes=0-1048575 (first 1MB)
+activate S3
+
+alt S3 Service Unavailable
+    S3 --> UpdateAgent: 503 Service Unavailable
+    deactivate S3
+    UpdateAgent -> UpdateAgent: Retry with exponential backoff
+
+    alt All Retries Failed
+        UpdateAgent -> IoTCore: Report failure
+        note right #FF6B6B
+        **FMEA: S3 Repository Unavailable**
+        Severity: 8, RPN: 16
+        Mitigation: Multi-region S3, CloudFront CDN
+        end note
+    end
+end
+
+S3 --> UpdateAgent: 206 Partial Content (1MB chunk)
+note right
+**HTTP Range Requests for Resume**:
+- Download in 1MB chunks
+- Support resume after interruption
+- Validate checksum incrementally
+end note
+
+UpdateAgent -> IoTCore: Report progress 2%
+activate IoTCore
+IoTCore -> OTAService: Deliver progress
+OTAService -> DynamoDB: Update download_progress = 2%
+deactivate IoTCore
+
+UpdateAgent -> S3: GET Range: bytes=1048576-2097151 (chunk 2)
+S3 --> UpdateAgent: 206 Partial Content
+
+' Simulate interruption
+alt Network Connection Lost During Download
+    UpdateAgent -> S3: GET Range: bytes=10485760-11534335 (chunk 11)
+    S3 --X UpdateAgent: Connection timeout
+    deactivate S3
+
+    UpdateAgent -> UpdateAgent: Connection lost at 10MB (20% complete)
+
+    UpdateAgent -> IoTCore: Report paused {status: PAUSED, progress: 20%}
+    activate IoTCore
+    IoTCore -> OTAService: Deliver paused status
+    OTAService -> DynamoDB: Update status = PAUSED, progress = 20%
+    deactivate IoTCore
+
+    note over UpdateAgent, S3 #FFD93D
+    **FMEA: Network Connection Lost**
+    Severity: 6, RPN: 90 (Medium-High)
+    Mitigation: HTTP Range resume support
+    Recovery: Auto-resume when connection restored
+    end note
+
+    ' Connection restored
+    UpdateAgent -> UpdateAgent: Wait for connection (retry every 60s)
+    UpdateAgent -> UpdateAgent: Connection restored after 5 minutes
+
+    UpdateAgent -> S3: GET Range: bytes=10485760-11534335 (Resume)
+    activate S3
+    S3 --> UpdateAgent: 206 Partial Content (resuming)
+
+    UpdateAgent -> IoTCore: Report resumed {status: IN_PROGRESS}
+    activate IoTCore
+    IoTCore -> OTAService: Deliver resumed status
+    deactivate IoTCore
+
+    note over UpdateAgent #6BCF7F
+    **Download Resume Successful**
+    No data loss, continue from last chunk
+    HTTP Range requests enable efficient recovery
+    end note
+end
+
+' Continue downloading
+UpdateAgent -> UpdateAgent: Continue downloading (report every 10%)
+
+UpdateAgent -> S3: GET Range: bytes=52420608-52428799 (final chunk)
+S3 --> UpdateAgent: 206 Partial Content
+deactivate S3
+
+UpdateAgent -> UpdateAgent: Download complete (100%)
+
+== Checksum Validation ==
+
+UpdateAgent -> UpdateAgent: Verify SHA-256 checksum
+
+alt Checksum Mismatch
+    UpdateAgent -> Storage: Delete corrupted file
+    activate Storage
+    Storage --> UpdateAgent: File deleted
+    deactivate Storage
+
+    UpdateAgent -> IoTCore: Report failure {status: FAILED, error: "CHECKSUM_MISMATCH"}
+    note right #FF6B6B
+    **FMEA: Checksum Validation Failure**
+    Severity: 8, RPN: 16
+    Mitigation: Retry download
+    Security: Prevents corrupted firmware
+    end note
+end
+
+UpdateAgent -> UpdateAgent: Checksum valid ✓
+
+UpdateAgent -> IoTCore: Report download complete {progress: 100%}
+activate IoTCore
+IoTCore -> OTAService: Deliver completion
+OTAService -> DynamoDB: Update status = DOWNLOADED
+deactivate IoTCore
+
+deactivate UpdateAgent
+
+note over MQTT, Monitor
+**Phase 2 Complete: Update Downloaded and Validated**
+
+**Success Metrics**:
+- Download speed: 61.7 KB/s
+- Duration: 850 seconds (~14 minutes)
+- Interruptions handled: 1 (resumed successfully)
+- Checksum validated: ✓
+
+**Next**: See 03c-ota-installation.puml for installation phase
+end note
+
+@enduml

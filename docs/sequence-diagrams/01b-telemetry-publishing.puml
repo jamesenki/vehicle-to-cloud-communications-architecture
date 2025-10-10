@@ -1,0 +1,165 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define RETRY_COLOR #4ECDC4
+
+title Telemetry Flow Part 1B: Individual Message Publishing - Vehicle-to-Cloud
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+
+' Define participants
+actor "Vehicle ECU" as ECU
+participant "MQTT Client" as MQTTClient
+participant "AWS IoT Core" as IoTCore
+participant "IoT Rules Engine" as Rules
+participant "Lambda: Validator\n[Timeout: 15s]" as Validator
+participant "Lambda: Processor\n[Timeout: 30s]" as Processor
+participant "DynamoDB\n[WCU: 100]" as DynamoDB
+participant "Timestream" as Timestream
+database "S3: Dead Letter\n[Lifecycle: 90d]" as DLQ
+participant "CloudWatch" as CloudWatch
+
+note over ECU, CloudWatch
+**Prerequisite**: Connection established (see 01a-telemetry-connection.puml)
+**Frequency**: Every 1-10 minutes per vehicle
+**Payload**: Protocol Buffers, ~200-500 bytes
+**QoS**: 1 (at-least-once delivery)
+end note
+
+== Phase 2A: Individual Telemetry Publishing ==
+
+ECU -> ECU: Collect sensor data from CAN bus
+note right
+**Data Sources**:
+- Speed, RPM, gear position
+- Battery voltage, fuel level
+- Engine temp, oil pressure
+- GPS coordinates (if consent given)
+- Tire pressure (TPMS)
+end note
+
+ECU -> MQTTClient: Send telemetry data
+activate MQTTClient
+
+MQTTClient -> MQTTClient: Serialize to Protocol Buffers (proto3)
+MQTTClient -> MQTTClient: Generate message_id (UUID v4)
+
+MQTTClient -> IoTCore: PUBLISH (Topic Alias=1, QoS=1, Payload=protobuf)
+activate IoTCore
+
+alt #SUCCESS_COLOR Message Valid and Authorized
+    IoTCore --> MQTTClient: PUBACK (Packet ID, Reason Code: 0x00 Success)
+    note right #6BCF7F
+    **QoS 1 Guarantees**:
+    - At-least-once delivery
+    - Latency P50: <100ms, P99: <500ms
+    end note
+
+    IoTCore -> Rules: Trigger IoT Rules Engine
+    activate Rules
+
+    Rules -> Validator: Invoke validation Lambda
+    activate Validator
+
+    Validator -> Validator: Parse Protocol Buffer message
+    Validator -> Validator: Validate schema version
+    Validator -> Validator: Check required fields
+
+    Validator -> DynamoDB: Check for duplicate message_id
+    activate DynamoDB
+
+    alt #SUCCESS_COLOR Message ID Not Seen
+        DynamoDB --> Validator: No duplicate found
+
+        Validator -> Processor: Forward validated message
+        activate Processor
+
+        Processor -> Processor: Enrich with vehicle metadata
+
+        note right
+        **Parallel Database Writes**
+        DynamoDB and Timestream writes
+        happen concurrently for performance
+        end note
+
+        Processor -> DynamoDB: Write to operational DB
+        alt #SUCCESS_COLOR Write Success
+            DynamoDB --> Processor: Write successful
+        else #FAILURE_COLOR DynamoDB Throttling
+            DynamoDB --> Processor: ERROR: Throttling
+            Processor -> Processor: Retry with exponential backoff
+            alt Retry Failed
+                Processor -> DLQ: Send to Dead Letter Queue
+                Processor -> CloudWatch: ALERT: DynamoDB failure
+            end
+        end
+
+        Processor -> Timestream: Write time-series data
+        activate Timestream
+        alt #SUCCESS_COLOR Write Success
+            Timestream --> Processor: Write successful
+        else #FAILURE_COLOR Rejected Records
+            Timestream --> Processor: ERROR: Out-of-order timestamp
+            Processor -> DLQ: Store rejected record
+        end
+        deactivate Timestream
+
+        Processor --> Validator: Processing complete
+        deactivate Processor
+
+    else #WARNING_COLOR Duplicate Message ID
+        DynamoDB --> Validator: Duplicate found
+        Validator -> CloudWatch: Increment duplicate counter
+        Validator -> Validator: Discard duplicate silently
+        note right #FFD93D
+        **Deduplication**: 5-minute window
+        **Expected Rate**: <0.1% of messages
+        end note
+    end
+    deactivate DynamoDB
+    deactivate Validator
+    deactivate Rules
+
+else #FAILURE_COLOR Message Too Large (>128KB)
+    IoTCore --> MQTTClient: PUBACK (Reason Code: 0x95 - Packet Too Large)
+    MQTTClient -> MQTTClient: Split message or switch to batch topic
+
+else #FAILURE_COLOR Unauthorized Topic
+    IoTCore --> MQTTClient: PUBACK (Reason Code: 0x87 - Not Authorized)
+    IoTCore -> CloudWatch: WARN: Authorization failure
+    note right #FFD93D
+    **Security Event**: Unauthorized publish attempt
+    **Action**: Investigate device certificate
+    end note
+
+else #FAILURE_COLOR Network Failure (No PUBACK)
+    MQTTClient -> MQTTClient: Wait for PUBACK timeout (5s)
+    alt Timeout Expired
+        MQTTClient -> IoTCore: PUBLISH (DUP=true, same Packet ID)
+        alt Max Retries Exceeded
+            MQTTClient -> MQTTClient: Store in local persistent queue
+            note right #FF6B6B
+            **Local Storage**: Max 1000 messages
+            **Overflow**: Drop oldest messages
+            end note
+        end
+    end
+end
+
+deactivate IoTCore
+deactivate MQTTClient
+
+note over ECU, CloudWatch
+**FMEA: Message Publishing Phase**
+
+**Critical Failure Modes**:
+1. DynamoDB Throttling (RPN: 24)
+2. Network Timeout (RPN: 30)
+3. Message Too Large (RPN: 12)
+
+**Mitigation**: Exponential backoff, DLQ, local buffering
+**See also**: 01c-telemetry-batch.puml for batch processing
+end note
+
+@enduml

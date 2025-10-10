@@ -1,0 +1,193 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define RETRY_COLOR #4ECDC4
+
+title Telemetry Flow Part 1C: Batch Processing - Vehicle-to-Cloud
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+
+' Define participants
+actor "Vehicle ECU" as ECU
+participant "MQTT Client" as MQTTClient
+participant "AWS IoT Core" as IoTCore
+participant "IoT Rules Engine" as Rules
+participant "Lambda: Validator" as Validator
+participant "Lambda: Processor" as Processor
+participant "DynamoDB" as DynamoDB
+participant "Timestream" as Timestream
+database "S3: DLQ" as DLQ
+participant "CloudWatch" as CloudWatch
+
+note over ECU, CloudWatch
+**Batch Processing Optimization**
+**Frequency**: Every 60 minutes (off-peak hours)
+**Payload**: 25-50 messages compressed with ZSTD
+**Compression**: 60-80% size reduction
+**Cost Savings**: $2.73M annually for 1M vehicles
+end note
+
+== Phase 2B: Batched Telemetry Publishing ==
+
+ECU -> MQTTClient: Send batch of 25-50 telemetry messages
+activate MQTTClient
+
+MQTTClient -> MQTTClient: Aggregate telemetry from local buffer
+MQTTClient -> MQTTClient: Serialize to Protocol Buffers (TelemetryBatch)
+MQTTClient -> MQTTClient: Compress with ZSTD (level 3)
+
+note right
+**Batch Optimization**:
+- Uncompressed: 25 msgs × 400 bytes = 10KB
+- Compressed: ~2-4KB (60-80% reduction)
+- MQTT overhead: 54 bytes → 2 bytes (topic alias)
+- Total savings: 96% overhead + 70% payload
+end note
+
+MQTTClient -> MQTTClient: Generate batch_id (UUID v4)
+MQTTClient -> MQTTClient: Set compression_type=ZSTD in metadata
+
+MQTTClient -> IoTCore: PUBLISH (Topic=batch, Topic Alias=2, QoS=1)
+activate IoTCore
+
+alt #SUCCESS_COLOR Batch Message Valid
+    IoTCore --> MQTTClient: PUBACK
+    IoTCore -> Rules: Trigger batch processing rule
+    activate Rules
+
+    Rules -> Validator: Invoke batch validator Lambda
+    activate Validator
+
+    Validator -> Validator: Decompress ZSTD payload
+
+    alt #SUCCESS_COLOR Decompression Success
+        Validator -> Validator: Parse TelemetryBatch protobuf
+        Validator -> Validator: Verify batch_id, message_count, checksums
+
+        loop For each message in batch (25-50 messages)
+            Validator -> Validator: Validate individual telemetry message
+
+            alt Message Valid
+                Validator -> DynamoDB: Check for duplicate message_id
+                activate DynamoDB
+
+                alt Not Duplicate
+                    Validator -> Processor: Forward to processor
+                    activate Processor
+
+                    note right
+                    **Batch Writes (Performance Optimized)**
+                    DynamoDB and Timestream batch writes
+                    happen concurrently for max throughput
+                    end note
+
+                    Processor -> DynamoDB: BatchWriteItem (up to 25 items)
+                    note right
+                    **Batch Write Optimization**:
+                    - Single API call for 25 records
+                    - Reduced WCU consumption
+                    - Latency amortized across batch
+                    end note
+
+                    alt #SUCCESS_COLOR Batch Write Success
+                        DynamoDB --> Processor: All items written
+                    else #FAILURE_COLOR Partial Batch Failure
+                        DynamoDB --> Processor: UnprocessedItems returned
+                        Processor -> Processor: Retry unprocessed items
+                        alt Retry Failed
+                            Processor -> DLQ: Send unprocessed items to DLQ
+                            Processor -> CloudWatch: ALERT: Partial batch failure
+                        end
+                    end
+
+                    Processor -> Timestream: WriteRecords (batch insert)
+                    activate Timestream
+                    alt #SUCCESS_COLOR Success
+                        Timestream --> Processor: All records ingested
+                    else #FAILURE_COLOR Some Rejected
+                        Timestream --> Processor: RejectedRecords list
+                        Processor -> DLQ: Store rejected records
+                    end
+                    deactivate Timestream
+
+                    deactivate Processor
+                else Duplicate
+                    Validator -> CloudWatch: Increment batch duplicate counter
+                end
+                deactivate DynamoDB
+
+            else Message Invalid
+                Validator -> CloudWatch: WARN: Invalid message in batch
+                Validator -> DLQ: Store invalid message with batch context
+            end
+        end
+
+        Validator -> CloudWatch: Publish batch processing metrics
+        note right
+        **Batch Metrics**:
+        - batch.size (message count)
+        - batch.compression_ratio
+        - batch.processing_duration
+        - batch.success_rate
+        end note
+
+    else #FAILURE_COLOR Decompression Failed
+        Validator -> CloudWatch: ERROR: ZSTD decompression failure
+        Validator -> DLQ: Send raw compressed batch
+        Validator -> CloudWatch: ALERT: Batch decompression error
+
+        note right #FF6B6B
+        **Decompression Failures**:
+        - Corrupted payload
+        - Wrong compression algorithm
+        - Lambda memory exhausted
+
+        **Severity**: HIGH
+        **Impact**: Entire batch lost (25-50 messages)
+        **Recovery**: Vehicle will resend on next cycle
+        end note
+    end
+
+    deactivate Validator
+    deactivate Rules
+
+else #FAILURE_COLOR Batch Exceeds Maximum Size
+    IoTCore --> MQTTClient: PUBACK (Reason Code: 0x95 - Packet Too Large)
+
+    MQTTClient -> MQTTClient: Split batch into smaller chunks (12-13 messages each)
+    note right #FFD93D
+    **Batch Size Management**:
+    - Max MQTT payload: 128KB
+    - Typical batch: 2-4KB compressed
+    - Safety margin: Send max 50 messages
+    - If exceeded: Split and retry
+    end note
+
+    MQTTClient -> IoTCore: Retry with smaller batches
+end
+
+deactivate IoTCore
+deactivate MQTTClient
+
+note over ECU, CloudWatch
+**FMEA: Batch Processing Phase**
+
+**Critical Failure Modes**:
+1. Decompression Failure (Severity: HIGH, RPN: 48)
+2. Partial Batch Failure (Severity: MEDIUM, RPN: 24)
+3. Batch Size Exceeded (Severity: LOW, RPN: 12)
+
+**Performance Characteristics**:
+- Batch write: 70% reduction in Lambda invocations
+- Compression: 60-80% payload reduction
+- Topic aliases: 96% overhead reduction
+
+**Cost Optimization**: $2.73M annual savings for 1M vehicles
+
+**See also**:
+- 01a-telemetry-connection.puml for connection setup
+- 01b-telemetry-publishing.puml for individual messages
+end note
+
+@enduml
