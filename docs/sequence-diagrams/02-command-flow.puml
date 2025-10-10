@@ -1,0 +1,667 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define RETRY_COLOR #4ECDC4
+
+title Complete Remote Command Sequence with FMEA Coverage - Vehicle-to-Cloud Communications
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 250
+
+' Define all participants
+actor "Mobile User\n[Role: Vehicle Owner]" as User
+participant "Mobile App\n[JWT Auth]" as MobileApp
+participant "API Gateway\n[Rate Limit: 10 cmd/min]\n[Auth: OAuth 2.0]" as Gateway
+participant "Command Service\n[Timeout: 5s]\n[Circuit Breaker]" as CommandSvc
+database "DynamoDB\n[Command Tracking]\n[TTL: 24hr]" as DynamoDB
+participant "AWS IoT Core\n[MQTT 5.0 Broker]\n[QoS 1-2]" as IoTCore
+participant "MQTT Client\n[Vehicle ECU]\n[Keep-Alive: 5min]" as VehicleMQTT
+participant "Command Handler\n[Vehicle Gateway]\n[Timeout: 60s]" as VehicleHandler
+participant "CAN Bus\n[ISO 11898]" as CANBus
+participant "Door Lock ECU\n[Body Controller]" as DoorECU
+participant "Monitoring\n[CloudWatch]\n[Alert Threshold: 5/min]" as Monitor
+queue "DLQ\n[Failed Commands]\n[Retention: 7d]" as DLQ
+participant "Audit Log\n[Compliance]\n[Retention: 7yr]" as AuditLog
+
+== Phase 1: Authentication and Authorization ==
+User -> MobileApp: Tap "Lock Doors"
+activate MobileApp
+
+MobileApp -> Gateway: POST /api/v1/commands/lock\nAuthorization: Bearer {JWT}\n{vehicle_id, user_id}
+activate Gateway
+
+Gateway -> Gateway: Validate JWT token\n(exp, iss, aud)
+
+alt Token Valid and Not Expired
+    Gateway -> Gateway: Extract user_id and permissions
+    Gateway -> Gateway: Check authorization:\nuser owns vehicle_id?
+
+    alt User Authorized
+        note right of Gateway: Authorization successful
+    else User Not Authorized (Different Owner)
+        Gateway -> AuditLog: LOG: Unauthorized access attempt\nUser: {user_id}, Vehicle: {vehicle_id}
+        Gateway --> MobileApp: 403 Forbidden\n{error: "FORBIDDEN", message: "Not vehicle owner"}
+        MobileApp --> User: "You don't have access to this vehicle"
+        deactivate Gateway
+        deactivate MobileApp
+        return
+    end
+
+else Token Expired
+    Gateway -> Monitor: WARN: Expired token attempt
+    Gateway --> MobileApp: 401 Unauthorized\n{error: "TOKEN_EXPIRED", retry_after: 0}
+    deactivate Gateway
+    MobileApp -> MobileApp: Trigger token refresh
+    MobileApp --> User: "Session expired, please login"
+    deactivate MobileApp
+    return
+
+else Token Invalid (Malformed, Wrong Signature)
+    Gateway -> Monitor: ALERT: Invalid token (possible attack)
+    Gateway -> AuditLog: LOG: Invalid token attempt\nIP: {source_ip}, User-Agent: {ua}
+    Gateway --> MobileApp: 401 Unauthorized\n{error: "UNAUTHORIZED"}
+    deactivate Gateway
+    MobileApp --> User: "Authentication failed"
+    deactivate MobileApp
+    return
+end
+
+== Phase 2: Rate Limiting and Duplicate Detection ==
+Gateway -> Gateway: Check rate limit\n(10 commands/minute per vehicle)
+
+alt Rate Limit Exceeded
+    Gateway -> Monitor: WARN: Rate limit exceeded\nVehicle: {vehicle_id}
+    Gateway --> MobileApp: 429 Too Many Requests\n{retry_after: 60, limit: 10, window: 60}
+    deactivate Gateway
+    MobileApp --> User: "Too many commands, wait 60 seconds"
+    deactivate MobileApp
+    return
+
+else Within Rate Limit
+    Gateway -> Gateway: Generate command_id (UUID v4)
+    Gateway -> Gateway: Set command timeout (60 seconds)
+    Gateway -> Gateway: Set command priority\n(NORMAL for lock, HIGH for remote start)
+
+    Gateway -> CommandSvc: Create command\n{command_id, vehicle_id, user_id, type: LOCK_DOORS}
+    activate CommandSvc
+
+    ' Idempotency check
+    CommandSvc -> DynamoDB: Query by (vehicle_id, command_type, status)\nWHERE status IN (QUEUED, IN_PROGRESS)\nAND created_at > NOW() - 30s
+    activate DynamoDB
+
+    alt Duplicate Command Found (Idempotency)
+        DynamoDB --> CommandSvc: Existing command found\n{command_id: "abc-123", status: IN_PROGRESS}
+        deactivate DynamoDB
+
+        CommandSvc -> Monitor: INFO: Duplicate command detected (idempotent)
+        CommandSvc --> Gateway: 200 OK (Idempotent)\n{command_id: "abc-123", status: "DUPLICATE", message: "Command already in progress"}
+        deactivate CommandSvc
+        Gateway --> MobileApp: 200 OK\n{status: "IN_PROGRESS", estimated_completion: 5}
+        deactivate Gateway
+        MobileApp --> User: "Door lock command already in progress"
+        deactivate MobileApp
+        return
+
+    else No Duplicate - Proceed
+        DynamoDB --> CommandSvc: No active command found
+        deactivate DynamoDB
+
+        ' Create command tracking record
+        CommandSvc -> DynamoDB: PUT command record\n{\n  command_id, vehicle_id, user_id,\n  type: LOCK_DOORS,\n  status: QUEUED,\n  priority: NORMAL,\n  timeout: 60s,\n  created_at, expires_at\n}
+        activate DynamoDB
+
+        alt DynamoDB Write Success
+            DynamoDB --> CommandSvc: Write successful
+            deactivate DynamoDB
+
+            CommandSvc -> AuditLog: LOG: Command created\nCommand: {command_id}, User: {user_id}, Type: LOCK_DOORS
+
+        else DynamoDB Write Failure (Connection Lost)
+            DynamoDB --> CommandSvc: ERROR: ConditionalCheckFailedException
+            deactivate DynamoDB
+
+            CommandSvc -> Monitor: CRITICAL: DynamoDB write failed
+            CommandSvc --> Gateway: 503 Service Unavailable\n{error: "DATABASE_ERROR", retryable: true}
+            deactivate CommandSvc
+            Gateway --> MobileApp: 503 Service Unavailable\n{retry_after: 5}
+            deactivate Gateway
+            MobileApp --> User: "Service temporarily unavailable, try again"
+            deactivate MobileApp
+            return
+        end
+    end
+end
+
+== Phase 3: Publish Command to Vehicle via MQTT ==
+CommandSvc -> CommandSvc: Build RemoteCommandRequest protobuf\n{\n  command_id,\n  user_id,\n  lock_doors: {lock_trunk: true, enable_alarm: true},\n  priority: NORMAL,\n  timeout_seconds: 60\n}
+
+CommandSvc -> IoTCore: Publish to MQTT topic\nTopic: v2c/v1/us-east-1/{vehicle_id}/command/request\nQoS: 1 (At-least-once)\nPayload: RemoteCommandRequest (protobuf, 120 bytes)
+activate IoTCore
+
+alt Vehicle Online and Connected
+    IoTCore -> IoTCore: Check MQTT session\nClient ID: {vehicle_id}\nStatus: CONNECTED
+
+    IoTCore -> VehicleMQTT: Forward message\nQoS 1 with message_id
+    activate VehicleMQTT
+
+    VehicleMQTT -> IoTCore: PUBACK (QoS 1 acknowledgment)
+    IoTCore --> CommandSvc: MQTT publish acknowledged
+    deactivate IoTCore
+
+    CommandSvc -> DynamoDB: UPDATE command\nSET status = 'SENT', sent_at = NOW()
+    activate DynamoDB
+    DynamoDB --> CommandSvc: Updated
+    deactivate DynamoDB
+
+    CommandSvc --> Gateway: 202 Accepted\n{command_id, status: "SENT", estimated_completion: 5}
+    deactivate CommandSvc
+
+    Gateway --> MobileApp: 202 Accepted\n{command_id, status: "SENT"}
+    deactivate Gateway
+
+    MobileApp --> User: "Locking doors..."
+    deactivate MobileApp
+
+else Vehicle Offline (MQTT Session Expired)
+    IoTCore -> IoTCore: Check MQTT session\nClient ID: {vehicle_id}\nStatus: DISCONNECTED (last seen: 10 min ago)
+
+    IoTCore -> IoTCore: Store message in persistent session\n(Session Expiry Interval: 1 hour)
+
+    IoTCore --> CommandSvc: MQTT stored for offline device
+    deactivate IoTCore
+
+    CommandSvc -> DynamoDB: UPDATE command\nSET status = 'QUEUED_OFFLINE', queued_at = NOW()
+    activate DynamoDB
+    DynamoDB --> CommandSvc: Updated
+    deactivate DynamoDB
+
+    CommandSvc -> Monitor: WARN: Vehicle offline, command queued
+
+    CommandSvc --> Gateway: 202 Accepted\n{command_id, status: "QUEUED_OFFLINE", message: "Vehicle offline, will execute when connected"}
+    deactivate CommandSvc
+
+    Gateway --> MobileApp: 202 Accepted (Vehicle Offline)\n{status: "QUEUED", eta: "when vehicle connects"}
+    deactivate Gateway
+
+    MobileApp --> User: "Vehicle is offline. Command will execute when connected."
+    deactivate MobileApp
+
+    note over VehicleMQTT, IoTCore: Vehicle remains offline.\nCommand expires after 60 seconds.\nSee "Command Timeout Handling" section below.
+    return
+
+else IoT Core Unavailable (Service Outage)
+    IoTCore --> CommandSvc: ERROR: 503 Service Unavailable\n(MQTT broker unreachable)
+    deactivate IoTCore
+
+    CommandSvc -> CommandSvc: Retry with exponential backoff\n(3 attempts: 1s, 2s, 4s)
+
+    alt Retry Success
+        CommandSvc -> IoTCore: Retry publish
+        activate IoTCore
+        IoTCore --> CommandSvc: Success
+        deactivate IoTCore
+
+    else All Retries Failed
+        CommandSvc -> Monitor: CRITICAL: IoT Core unreachable after retries
+        CommandSvc -> DLQ: Send command to DLQ\n{command_id, reason: "MQTT_BROKER_UNAVAILABLE"}
+
+        CommandSvc -> DynamoDB: UPDATE command\nSET status = 'FAILED', error = 'SERVICE_UNAVAILABLE'
+        activate DynamoDB
+        DynamoDB --> CommandSvc: Updated
+        deactivate DynamoDB
+
+        CommandSvc --> Gateway: 503 Service Unavailable\n{error: "MESSAGE_QUEUE_ERROR", retryable: true}
+        deactivate CommandSvc
+
+        Gateway --> MobileApp: 503 Service Unavailable
+        deactivate Gateway
+
+        MobileApp --> User: "Service temporarily unavailable"
+        deactivate MobileApp
+        return
+    end
+end
+
+== Phase 4: Vehicle Receives and Validates Command ==
+VehicleMQTT -> VehicleMQTT: Deserialize RemoteCommandRequest\n(protobuf parsing)
+
+alt Protobuf Parsing Success
+    VehicleMQTT -> VehicleHandler: Forward command\n{command_id, type: LOCK_DOORS, timeout: 60s}
+    activate VehicleHandler
+
+else Protobuf Parsing Failed (Corrupted Payload)
+    VehicleMQTT -> Monitor: ERROR: Invalid protobuf message
+    VehicleMQTT -> VehicleMQTT: Build error response\n{command_id, status: FAILED, reason: "INVALID_MESSAGE_FORMAT"}
+    VehicleMQTT -> IoTCore: Publish error response\nTopic: v2c/v1/us-east-1/{vehicle_id}/command/response\nQoS: 1
+    activate IoTCore
+    IoTCore --> VehicleMQTT: PUBACK
+    deactivate IoTCore
+    deactivate VehicleMQTT
+    return
+end
+
+' Duplicate detection on vehicle side
+VehicleHandler -> VehicleHandler: Check command cache\n(last 100 commands, TTL: 5 min)
+
+alt Command Already Executed (Duplicate)
+    VehicleHandler -> Monitor: INFO: Duplicate command (already executed)
+    VehicleHandler -> VehicleMQTT: Send response\n{command_id, status: DUPLICATE}
+    activate VehicleMQTT
+    VehicleMQTT -> IoTCore: Publish response\nTopic: v2c/v1/us-east-1/{vehicle_id}/command/response\nQoS: 1
+    activate IoTCore
+    IoTCore --> VehicleMQTT: PUBACK
+    deactivate IoTCore
+    deactivate VehicleMQTT
+    deactivate VehicleHandler
+    return
+
+else New Command - Proceed
+    VehicleHandler -> VehicleHandler: Add to cache\n{command_id, timestamp}
+end
+
+' Precondition validation
+VehicleHandler -> VehicleHandler: Validate preconditions:\n- Vehicle speed < 5 km/h\n- Ignition state\n- Transmission gear (P or N)\n- Battery level > 20%
+
+alt Preconditions Met (Happy Path)
+    note right of VehicleHandler: All safety checks passed
+
+else Speed Too High (Vehicle Moving)
+    VehicleHandler -> Monitor: WARN: Command rejected - vehicle moving\nSpeed: {current_speed} km/h
+
+    VehicleHandler -> VehicleMQTT: Send response\n{command_id, status: REJECTED, reason: "PRECONDITION_FAILED: Vehicle moving (speed > 5 km/h)"}
+    activate VehicleMQTT
+
+    VehicleMQTT -> IoTCore: Publish response\nTopic: v2c/v1/us-east-1/{vehicle_id}/command/response\nQoS: 1
+    activate IoTCore
+    IoTCore --> VehicleMQTT: PUBACK
+    deactivate IoTCore
+    deactivate VehicleMQTT
+    deactivate VehicleHandler
+
+    note over MobileApp, User: See "Phase 5: Command Response Handling"\nfor response processing
+    return
+
+else Battery Too Low
+    VehicleHandler -> Monitor: WARN: Command rejected - low battery\nBattery: {battery_level}%
+
+    VehicleHandler -> VehicleMQTT: Send response\n{command_id, status: REJECTED, reason: "PRECONDITION_FAILED: Battery too low (< 20%)"}
+    activate VehicleMQTT
+
+    VehicleMQTT -> IoTCore: Publish response\nQoS: 1
+    activate IoTCore
+    IoTCore --> VehicleMQTT: PUBACK
+    deactivate IoTCore
+    deactivate VehicleMQTT
+    deactivate VehicleHandler
+    return
+
+else Gear Not in Park (Transmission Issue)
+    VehicleHandler -> Monitor: WARN: Command rejected - gear not in park\nGear: {current_gear}
+
+    VehicleHandler -> VehicleMQTT: Send response\n{command_id, status: REJECTED, reason: "PRECONDITION_FAILED: Vehicle must be in Park"}
+    activate VehicleMQTT
+
+    VehicleMQTT -> IoTCore: Publish response\nQoS: 1
+    activate IoTCore
+    IoTCore --> VehicleMQTT: PUBACK
+    deactivate IoTCore
+    deactivate VehicleMQTT
+    deactivate VehicleHandler
+    return
+end
+
+== Phase 5: Command Execution on Vehicle ==
+VehicleHandler -> VehicleMQTT: Send ACCEPTED response
+activate VehicleMQTT
+
+VehicleMQTT -> IoTCore: Publish response\nTopic: v2c/v1/us-east-1/{vehicle_id}/command/response\n{command_id, status: ACCEPTED, estimated_execution: 3s}
+activate IoTCore
+
+IoTCore --> VehicleMQTT: PUBACK
+deactivate IoTCore
+deactivate VehicleMQTT
+
+VehicleHandler -> CANBus: Send CAN message\nCAN ID: 0x2A0 (Body Control)\nData: [0x01, 0xFF, 0x01, 0x01, ...]\nLock doors, enable alarm
+activate CANBus
+
+alt CAN Bus Healthy
+    CANBus -> DoorECU: Forward CAN message
+    activate DoorECU
+
+    DoorECU -> DoorECU: Validate command\n- Check door actuator status\n- Check motor current
+
+    alt Door Actuators Functional
+        DoorECU -> DoorECU: Activate door lock motors\n(all 4 doors + trunk)
+
+        DoorECU -> DoorECU: Monitor motor current\n(detect obstruction)
+
+        alt All Doors Locked Successfully
+            DoorECU -> DoorECU: Enable alarm system
+            DoorECU -> DoorECU: Flash lights (confirmation)
+
+            DoorECU -> CANBus: Send confirmation\nCAN ID: 0x2A1\nStatus: SUCCESS (all doors locked)
+            deactivate DoorECU
+
+            CANBus --> VehicleHandler: Door lock success
+            deactivate CANBus
+
+            VehicleHandler -> VehicleHandler: Update command cache\n{command_id, status: COMPLETED}
+
+            VehicleHandler -> VehicleMQTT: Send COMPLETED response\n{command_id, status: COMPLETED, vehicle_state: {locked: true, doors_open: false}}
+            activate VehicleMQTT
+
+            VehicleMQTT -> IoTCore: Publish response\nTopic: v2c/v1/us-east-1/{vehicle_id}/command/response\nQoS: 1
+            activate IoTCore
+            IoTCore --> VehicleMQTT: PUBACK
+            deactivate IoTCore
+            deactivate VehicleMQTT
+
+        else Partial Lock Failure (Door Open)
+            DoorECU -> DoorECU: Doors locked: [FL, FR, RL]\nDoors failed: [RR - door open]
+
+            DoorECU -> CANBus: Send partial success\nCAN ID: 0x2A1\nStatus: PARTIAL (RR door open)
+            deactivate DoorECU
+
+            CANBus --> VehicleHandler: Partial lock (RR open)
+            deactivate CANBus
+
+            VehicleHandler -> Monitor: WARN: Partial lock - door open\nDoor: Rear Right
+
+            VehicleHandler -> VehicleMQTT: Send response\n{command_id, status: FAILED, reason: "PARTIAL_EXECUTION: Rear right door open"}
+            activate VehicleMQTT
+
+            VehicleMQTT -> IoTCore: Publish response\nQoS: 1
+            activate IoTCore
+            IoTCore --> VehicleMQTT: PUBACK
+            deactivate IoTCore
+            deactivate VehicleMQTT
+        end
+
+    else Door Actuator Failure (Hardware Fault)
+        DoorECU -> DoorECU: Set DTC: B1234\n"Door Lock Actuator - Circuit Failure"
+
+        DoorECU -> CANBus: Send error\nCAN ID: 0x2A1\nStatus: HARDWARE_FAILURE
+        deactivate DoorECU
+
+        CANBus --> VehicleHandler: Hardware failure
+        deactivate CANBus
+
+        VehicleHandler -> Monitor: ERROR: Door actuator failure\nDTC: B1234
+
+        VehicleHandler -> VehicleMQTT: Send response\n{command_id, status: FAILED, reason: "HARDWARE_FAILURE: Door actuator fault"}
+        activate VehicleMQTT
+
+        VehicleMQTT -> IoTCore: Publish response\nQoS: 1
+        activate IoTCore
+        IoTCore --> VehicleMQTT: PUBACK
+        deactivate IoTCore
+        deactivate VehicleMQTT
+    end
+
+else CAN Bus Timeout (No Response from ECU)
+    CANBus --> VehicleHandler: ERROR: Timeout (no response after 5s)
+    deactivate CANBus
+
+    VehicleHandler -> VehicleHandler: Retry CAN message (3 attempts)
+
+    alt Retry Success
+        VehicleHandler -> CANBus: Retry CAN message
+        activate CANBus
+        CANBus -> DoorECU: Forward message
+        activate DoorECU
+        DoorECU -> CANBus: Success
+        deactivate DoorECU
+        CANBus --> VehicleHandler: Success
+        deactivate CANBus
+
+    else All Retries Failed
+        VehicleHandler -> Monitor: CRITICAL: CAN bus timeout after retries\nECU: Body Controller
+
+        VehicleHandler -> VehicleMQTT: Send response\n{command_id, status: FAILED, reason: "TIMEOUT: CAN bus timeout"}
+        activate VehicleMQTT
+
+        VehicleMQTT -> IoTCore: Publish response\nQoS: 1
+        activate IoTCore
+        IoTCore --> VehicleMQTT: PUBACK
+        deactivate IoTCore
+        deactivate VehicleMQTT
+    end
+end
+
+deactivate VehicleHandler
+
+== Phase 6: Cloud Receives Command Response ==
+IoTCore -> CommandSvc: Forward MQTT message\nTopic: v2c/v1/us-east-1/{vehicle_id}/command/response\n{command_id, status: COMPLETED}
+activate CommandSvc
+
+CommandSvc -> DynamoDB: UPDATE command\nSET status = 'COMPLETED', completed_at = NOW(), execution_time_ms = {duration}
+activate DynamoDB
+
+alt DynamoDB Update Success
+    DynamoDB --> CommandSvc: Updated
+    deactivate DynamoDB
+
+    CommandSvc -> AuditLog: LOG: Command completed\nCommand: {command_id}, Status: COMPLETED, Duration: {duration}ms
+
+    CommandSvc -> Monitor: METRIC: Command latency\nP50: 2.1s, P99: 4.8s
+
+else DynamoDB Update Failed
+    DynamoDB --> CommandSvc: ERROR: Write failed
+    deactivate DynamoDB
+
+    CommandSvc -> Monitor: ERROR: Failed to update command status\nCommand: {command_id}
+    ' Continue - don't fail the command response
+end
+
+' Notify mobile app via WebSocket or push notification
+CommandSvc -> MobileApp: Push Notification\n{command_id, status: "COMPLETED", message: "Doors locked"}
+activate MobileApp
+
+MobileApp --> User: Notification: "Your vehicle is locked"
+deactivate MobileApp
+
+deactivate CommandSvc
+
+== Phase 7: Command Timeout Handling (Alternative Flow) ==
+note over CommandSvc, Monitor: If vehicle doesn't respond within timeout (60s),\nbackground job detects and handles timeout.
+
+CommandSvc -> CommandSvc: Background job runs every 10s\nQuery commands WHERE status IN ('SENT', 'QUEUED')\nAND created_at < NOW() - timeout
+activate CommandSvc
+
+alt Command Timed Out
+    CommandSvc -> DynamoDB: UPDATE command\nSET status = 'EXPIRED', expired_at = NOW()
+    activate DynamoDB
+    DynamoDB --> CommandSvc: Updated
+    deactivate DynamoDB
+
+    CommandSvc -> Monitor: ALERT: Command timeout\nCommand: {command_id}, Age: 60s
+
+    CommandSvc -> MobileApp: Push Notification\n{command_id, status: "EXPIRED", message: "Command timed out"}
+    activate MobileApp
+
+    MobileApp --> User: "Command timed out. Vehicle may be offline."
+    deactivate MobileApp
+
+    CommandSvc -> AuditLog: LOG: Command expired\nCommand: {command_id}, Reason: TIMEOUT
+end
+
+deactivate CommandSvc
+
+== Phase 8: Command Cancellation Flow (User Cancels) ==
+note over User, MobileApp: User changes mind and cancels command\nwhile it's still in progress.
+
+User -> MobileApp: Tap "Cancel Command"
+activate MobileApp
+
+MobileApp -> Gateway: POST /api/v1/commands/{command_id}/cancel\nAuthorization: Bearer {JWT}
+activate Gateway
+
+Gateway -> CommandSvc: Cancel command\n{command_id, cancellation_reason: USER_CANCELLED}
+activate CommandSvc
+
+CommandSvc -> DynamoDB: Query command by command_id
+activate DynamoDB
+
+alt Command Found and Cancellable (QUEUED or IN_PROGRESS)
+    DynamoDB --> CommandSvc: Command found\n{status: IN_PROGRESS}
+    deactivate DynamoDB
+
+    CommandSvc -> DynamoDB: UPDATE command\nSET status = 'CANCELLED', cancelled_at = NOW()
+    activate DynamoDB
+    DynamoDB --> CommandSvc: Updated
+    deactivate DynamoDB
+
+    CommandSvc -> IoTCore: Publish cancellation\nTopic: v2c/v1/us-east-1/{vehicle_id}/command/cancel\n{command_id, reason: USER_CANCELLED, priority: HIGH}
+    activate IoTCore
+
+    alt Vehicle Online
+        IoTCore -> VehicleMQTT: Forward cancellation\nQoS: 2 (Exactly-once)
+        activate VehicleMQTT
+
+        VehicleMQTT -> VehicleHandler: Cancel command\n{command_id}
+        activate VehicleHandler
+
+        VehicleHandler -> VehicleHandler: Stop command execution\n(if still in progress)
+
+        VehicleHandler -> VehicleHandler: Perform cleanup/rollback\n(e.g., unlock doors if partially locked)
+
+        VehicleHandler -> VehicleMQTT: Send cancellation ack\n{command_id, status: CANCELLED}
+        VehicleMQTT -> IoTCore: Publish ack\nTopic: v2c/v1/us-east-1/{vehicle_id}/command/cancel/ack
+        deactivate VehicleHandler
+        deactivate VehicleMQTT
+
+        IoTCore --> CommandSvc: Cancellation acknowledged
+        deactivate IoTCore
+
+    else Vehicle Offline
+        IoTCore -> IoTCore: Store cancellation in session\n(deliver when vehicle connects)
+        IoTCore --> CommandSvc: Stored for offline delivery
+        deactivate IoTCore
+    end
+
+    CommandSvc -> AuditLog: LOG: Command cancelled\nCommand: {command_id}, Reason: USER_CANCELLED
+
+    CommandSvc --> Gateway: 200 OK\n{status: "CANCELLED"}
+    deactivate CommandSvc
+
+    Gateway --> MobileApp: 200 OK\n{message: "Command cancelled"}
+    deactivate Gateway
+
+    MobileApp --> User: "Command cancelled successfully"
+    deactivate MobileApp
+
+else Command Already Completed
+    DynamoDB --> CommandSvc: Command found\n{status: COMPLETED}
+    deactivate DynamoDB
+
+    CommandSvc --> Gateway: 409 Conflict\n{error: "ALREADY_COMPLETED", message: "Command already completed"}
+    deactivate CommandSvc
+
+    Gateway --> MobileApp: 409 Conflict
+    deactivate Gateway
+
+    MobileApp --> User: "Command already completed, cannot cancel"
+    deactivate MobileApp
+
+else Command Not Found
+    DynamoDB --> CommandSvc: Not found
+    deactivate DynamoDB
+
+    CommandSvc --> Gateway: 404 Not Found\n{error: "COMMAND_NOT_FOUND"}
+    deactivate CommandSvc
+
+    Gateway --> MobileApp: 404 Not Found
+    deactivate Gateway
+
+    MobileApp --> User: "Command not found"
+    deactivate MobileApp
+end
+
+== Monitoring and Alerting ==
+Monitor -> Monitor: Aggregate metrics every 30s:\n- Command success rate\n- Average latency (P50, P95, P99)\n- Error rate by error code\n- Vehicle online rate
+
+alt Command Success Rate < 95%
+    Monitor -> Monitor: Trigger PagerDuty alert\n"Command success rate: 92%"\nSeverity: HIGH
+
+else Command Latency P99 > 10 seconds
+    Monitor -> Monitor: Trigger CloudWatch alarm\n"Command latency P99: 12.5s"\nSeverity: MEDIUM
+
+else Vehicle Offline Rate > 20%
+    Monitor -> Monitor: Send email alert to ops team\n"20% of fleet offline"\nSeverity: LOW
+
+else DLQ Messages > 100
+    Monitor -> Monitor: Trigger alert for manual review\n"DLQ has 150 failed commands"\nSeverity: MEDIUM
+end
+
+== Manual Recovery Procedures ==
+actor "On-Call Engineer" as Engineer
+
+alt DLQ Contains Failed Commands
+    Engineer -> DLQ: Review failed commands\n(Query by error code, timestamp)
+
+    alt Retryable Error (Service Outage Recovered)
+        Engineer -> DLQ: Replay messages to IoT Core
+        Engineer -> Monitor: "Replayed 50 commands from DLQ"
+
+    else Permanent Error (Invalid Vehicle ID)
+        Engineer -> DLQ: Purge messages
+        Engineer -> AuditLog: LOG: DLQ purged\nReason: Invalid vehicle IDs
+    end
+end
+
+alt Circuit Breaker Open (Too Many Failures)
+    Engineer -> CommandSvc: Reset circuit breaker manually
+    Engineer -> Monitor: "Circuit breaker reset"
+    CommandSvc -> CommandSvc: Circuit breaker state: CLOSED\nResuming normal operations
+end
+
+alt Database Connection Pool Exhausted
+    Engineer -> DynamoDB: Increase provisioned throughput\n(Read: 100 -> 200 RCU)\n(Write: 100 -> 200 WCU)
+    Engineer -> CommandSvc: Increase connection pool size\n(Max connections: 50 -> 100)
+end
+
+== FMEA Annotations ==
+note over User, AuditLog
+**FAILURE MODES COVERED:**
+1. Authentication failures (expired token, invalid token, missing token)
+2. Authorization failures (user not vehicle owner, permission denied)
+3. Rate limiting (command flooding prevention)
+4. Duplicate commands (idempotency at cloud and vehicle)
+5. Vehicle offline (persistent session, command queueing)
+6. MQTT broker unavailable (retry with exponential backoff, DLQ)
+7. Database failures (DynamoDB write/read errors, connection pool)
+8. Precondition failures (speed, battery, gear, safety checks)
+9. CAN bus timeouts (ECU not responding, retries)
+10. Hardware failures (door actuator fault, DTCs)
+11. Partial execution (some doors locked, some failed)
+12. Command timeout (vehicle doesn't respond within 60s)
+13. Command cancellation (user cancels, cleanup/rollback)
+14. Message parsing errors (corrupted protobuf)
+15. Network errors (TLS handshake, connection lost)
+
+**PERFORMANCE REQUIREMENTS:**
+- SLA: < 5 seconds total latency (P95)
+- Success rate: > 99% (excluding vehicle offline)
+- Vehicle response timeout: 60 seconds
+- Rate limit: 10 commands/minute per vehicle
+- DynamoDB: Single-digit millisecond latency
+
+**SECURITY MEASURES:**
+- Mutual TLS (mTLS) for vehicle-cloud connection
+- JWT authentication for mobile app
+- OAuth 2.0 authorization
+- Audit logging (7-year retention for compliance)
+- Rate limiting (prevent DoS)
+- Command validation (prevent replay attacks)
+
+**RECOVERY STRATEGIES:**
+- Automatic retry (exponential backoff)
+- Dead letter queue (manual review and replay)
+- Circuit breaker (prevent cascading failures)
+- Idempotency (safe to retry)
+- Graceful degradation (queue commands when vehicle offline)
+- Monitoring and alerting (proactive issue detection)
+end note
+
+@enduml

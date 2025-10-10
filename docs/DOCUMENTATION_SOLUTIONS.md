@@ -394,10 +394,10 @@ mqtt_client_message_life_cycle.png
 ## Architecture Diagrams
 
 ### Project Architecture
-![C4 Architecture](src/main/doc/puml/C4_Project_Architecture.png)
+![C4 Architecture](../src/main/doc/puml/C4_Project_Architecture.png)
 
 ### MQTT Client Lifecycle
-![MQTT Lifecycle](src/main/doc/puml/mqtt_client_message_life_cycle.png)
+![MQTT Lifecycle](../src/main/doc/puml/mqtt_client_message_life_cycle.png)
 ```
 
 ### Option B: PlantUML Server

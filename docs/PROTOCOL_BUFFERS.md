@@ -25,23 +25,23 @@ The following MQTT topics are used for publishing and subscribing to vehicle mes
 
 ### C4 Project Architecture
 
-![C4 Project Architecture](src/main/doc/puml/C4_Project_Architecture.png)
+![C4 Project Architecture](../src/main/doc/puml/C4_Project_Architecture.png)
 
 ### HighLow
 
-![HighLow](src/main/doc/puml/HighLow.png)
+![HighLow](../src/main/doc/puml/HighLow.png)
 
 ### VehicleMessageHeader
 
-![VehicleMessageHeader](src/main/doc/puml/VehicleMessageHeader.png)
+![VehicleMessageHeader](../src/main/doc/puml/VehicleMessageHeader.png)
 
 ### Aws Plant Example
 
-![Aws Plant Example](src/main/doc/puml/aws_plant_example.png)
+![Aws Plant Example](../src/main/doc/puml/aws_plant_example.png)
 
 ### Mqtt Client Message Life Cycle
 
-![Mqtt Client Message Life Cycle](src/main/doc/puml/mqtt_client_message_life_cycle.png)
+![Mqtt Client Message Life Cycle](../src/main/doc/puml/mqtt_client_message_life_cycle.png)
 
 ## Message Definitions
 
@@ -2034,7 +2034,7 @@ Vehicle reports flush completion
 
 #### Message: VehicleMessageHeader
 
-# Vehicle Message Header  This message defines an application message header for messages past across the system. This is useful because the standard MQTT message headers are typically local to the broker of the system, so while the MQTT headers are useful for QoS assurances and message debugging they do not necessarily correlate the messages to the services deeper in the vehicle or the cloud services.  ## Message Orchestration ![HeaderMessage.puml](build/resources/main/V2C/images/HeaderMessage.png)  ## MQTT Topic Design | Direction        | Subscribe Topic | Publish Topic | | -----------      | -----           | --------      | | Vehicle to Cloud | No Topic        | No Topic      | | -----------      | -----           | --------      | | Cloud to Vehicle | No Topic        |  No Topic     |  
+# Vehicle Message Header  This message defines an application message header for messages past across the system. This is useful because the standard MQTT message headers are typically local to the broker of the system, so while the MQTT headers are useful for QoS assurances and message debugging they do not necessarily correlate the messages to the services deeper in the vehicle or the cloud services.  ## Message Orchestration <!-- HeaderMessage diagram not available -->  ## MQTT Topic Design | Direction        | Subscribe Topic | Publish Topic | | -----------      | -----           | --------      | | Vehicle to Cloud | No Topic        | No Topic      | | -----------      | -----           | --------      | | Cloud to Vehicle | No Topic        |  No Topic     |  
 
 **Fields:**
 

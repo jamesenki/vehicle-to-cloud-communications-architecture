@@ -42,7 +42,7 @@ are useful for QoS assurances and message debugging they do not necessarily corr
 services deeper in the vehicle or the cloud services. 
 
 ## Message Orchestration
-![HeaderMessage.puml](build/resources/main/V2C/images/HeaderMessage.png)
+<!-- HeaderMessage diagram not available -->
 
 ## MQTT Topic Design
 | Direction        | Subscribe Topic | Publish Topic | 

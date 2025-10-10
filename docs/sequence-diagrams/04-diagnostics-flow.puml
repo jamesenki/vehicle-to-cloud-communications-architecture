@@ -1,0 +1,1069 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define RETRY_COLOR #4ECDC4
+!define CRITICAL_COLOR #FF4757
+
+title FMEA-Ready Sequence: Diagnostics (DTC) Message Flow - Vehicle-to-Cloud Communications
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+
+' ============================================================================
+' PARTICIPANTS - Complete System Architecture
+' ============================================================================
+
+participant "Vehicle ECU\n[Engine Control Unit]\n[OBD-II SAE J1979]" as ECU #LightBlue
+participant "OBD-II Interface\n[ISO 15765-4 CAN]\n[Timeout: 5s]" as OBD #LightCyan
+participant "Diagnostic Agent\n[In-Vehicle Gateway]\n[Deduplication Cache]" as DiagAgent #LightGreen
+participant "MQTT Client\n[QoS: 0,1,2]\n[Keep-Alive: 300s]" as MQTTClient #LightSalmon
+queue "AWS IoT Core\n[MQTT 5.0 Broker]\n[mTLS X.509]\n[Message Limit: 128KB]" as IoTCore #LightPink
+participant "Lambda: DTC Processor\n[Timeout: 30s]\n[Concurrency: 100]\n[Memory: 512MB]" as DTCProcessor #LightYellow
+database "DynamoDB: DTC History\n[Partition: vehicle_id]\n[TTL: 5 years]" as DTCHistory #LightGray
+participant "ML Service\n[SageMaker Endpoint]\n[Timeout: 10s]\n[Model: Predictive Maintenance v2.3]" as MLService #Orange
+participant "Service Recommendation\n[Business Rules Engine]\n[OEM Database]" as ServiceReco #LightGreen
+participant "Customer Notification\n[SNS/SES/FCM]\n[Multi-Channel]" as Notification #LightCyan
+participant "Warranty Service\n[REST API]\n[Timeout: 15s]" as Warranty #LightBlue
+participant "Emergency Towing\n[3rd Party API]\n[Critical DTCs Only]" as Towing #CRITICAL_COLOR
+queue "Dead Letter Queue\n[SQS, Retention: 14d]" as DLQ #FAILURE_COLOR
+participant "Monitoring\n[CloudWatch]\n[Alert Threshold: 5% error rate]" as Monitor #Orange
+actor "On-Call Engineer\n[PagerDuty]" as Engineer #Red
+actor "Vehicle Owner\n[Mobile App]" as Owner #LightBlue
+
+== DTC Detection Phase (On-Board Diagnostics) ==
+
+note over ECU
+  **OBD-II Continuous Monitoring**
+  - 500+ PIDs monitored per second
+  - 4 monitoring cycles for DTC confirmation
+  - SAE J1979 standard compliance
+end note
+
+ECU -> ECU: Detect fault condition\n(e.g., Mass Airflow Sensor out of range)
+activate ECU
+
+ECU -> ECU: Run diagnostic test (3 drive cycles)
+note right
+  **DTC Confirmation Process**
+  - Pending: 1st occurrence
+  - Confirmed: 2nd occurrence
+  - Active: 3rd occurrence
+  MTBF: 50,000 hours
+end note
+
+alt DTC Confirmed (Active)
+    ECU -> ECU: Set DTC Active status\nCode: P0171 (System Too Lean Bank 1)
+    ECU -> ECU: Classify DTC severity and category
+
+    note right #WARNING_COLOR
+      **Severity Classification**
+      - INFO: Informational only
+      - LOW: Service recommended (< 1000 km)
+      - MEDIUM: Service soon (< 500 km)
+      - HIGH: Service immediately (< 100 km)
+      - CRITICAL: Do not drive (tow required)
+
+      **Category Taxonomy**
+      - P0xxx: Powertrain (SAE)
+      - P1xxx: Powertrain (OEM)
+      - C0xxx: Chassis
+      - B0xxx: Body
+      - U0xxx: Network/CAN
+    end note
+
+    ECU -> ECU: Capture freeze frame data
+
+    alt Freeze Frame Capture Success
+        ECU -> ECU: Snapshot vehicle state:\n- Engine RPM: 2200\n- Speed: 80 km/h\n- Throttle: 42%\n- Coolant: 92°C\n- MAF: 4.2 g/s\n- O2 Sensor: 0.45V\n- Fuel Trim: +15%
+        note right #SUCCESS_COLOR
+          **Freeze Frame Data Points**
+          - 20+ PIDs captured
+          - Timestamp: EPOCH ms
+          - Mileage: 125,430 km
+          - VIN: Embedded
+          Storage: ECU EEPROM
+        end note
+
+    else Freeze Frame Capture Failure
+        ECU -> ECU: Retry capture (3 attempts, 100ms delay)
+
+        alt Retry Success
+            ECU -> ECU: Partial freeze frame captured
+            note right #WARNING_COLOR
+              FMEA: Incomplete Freeze Frame
+              Severity: 4 (impacts diagnosis)
+              Occurrence: 3 (sensor communication failure)
+              Detection: 8 (only detected during analysis)
+              RPN: 96 (Medium - acceptable)
+              Mitigation: Use partial data + historical correlation
+            end note
+
+        else All Retries Failed
+            ECU -> ECU: Store DTC without freeze frame
+            ECU -> Monitor: ERROR: Freeze frame capture failed\n(ecu_id, dtc_code, error_type)
+            note right #FAILURE_COLOR
+              FMEA: Missing Freeze Frame Data
+              Severity: 6 (significant diagnosis limitation)
+              Occurrence: 2 (rare hardware fault)
+              Detection: 7 (detected only during review)
+              RPN: 84 (Low-Medium - acceptable)
+              Mitigation: Request snapshot from cloud
+            end note
+        end
+    end
+
+else DTC Pending (Not Confirmed)
+    ECU -> ECU: Store as PENDING status
+    note right
+      No cloud reporting until confirmed
+      Prevents false positives
+    end note
+    deactivate ECU
+    [-> ECU: Wait for next drive cycle
+
+else Normal Operation
+    ECU -> ECU: Continue monitoring
+    deactivate ECU
+end
+
+== DTC Reporting to Diagnostic Agent ==
+
+ECU -> OBD: Notify new DTC available\n(CAN Bus: 0x7DF broadcast)
+activate OBD
+
+OBD -> DiagAgent: Poll DTC data\n(Mode $03: Request Stored DTCs)
+activate DiagAgent
+
+alt OBD-II Communication Success
+    DiagAgent -> OBD: Send request\n(PID: $03, Format: ISO 15765-4)
+    OBD -> ECU: Read DTC(s) from ECU memory
+    activate ECU
+
+    ECU --> OBD: DTC data packet\n(P0171, occurrence: 3, first: 2025-10-08, last: 2025-10-10)
+    deactivate ECU
+
+    OBD --> DiagAgent: DTC Report\n{code: P0171, severity: MEDIUM, category: POWERTRAIN}
+    deactivate OBD
+
+else OBD-II Timeout (>5s)
+    DiagAgent -> DiagAgent: Retry with exponential backoff\n(Attempt 1/3, delay 1s)
+
+    alt Retry Successful
+        OBD --> DiagAgent: DTC data received
+
+    else All Retries Failed
+        DiagAgent -> Monitor: CRITICAL: OBD-II communication failure\n(vehicle_id, ecu_id, timeout_duration)
+        note right #FAILURE_COLOR
+          FMEA: OBD-II Communication Failure
+          Severity: 8 (no diagnostics available)
+          Occurrence: 2 (rare CAN bus fault)
+          Detection: 2 (immediate timeout detection)
+          RPN: 32 (Low - acceptable)
+          Mitigation: Store locally, retry on next ignition cycle
+        end note
+
+        DiagAgent -> DiagAgent: Cache DTC locally for next attempt
+        deactivate DiagAgent
+        [-> DiagAgent: Retry on next ignition cycle
+    end
+
+else ECU Not Responding
+    OBD --> DiagAgent: ERROR: ECU offline
+    DiagAgent -> Monitor: ALERT: ECU communication lost
+    note right #FAILURE_COLOR
+      FMEA: ECU Offline
+      Severity: 9 (critical safety impact)
+      Occurrence: 1 (extremely rare)
+      Detection: 1 (immediate detection)
+      RPN: 9 (Very Low - acceptable)
+      Mitigation: Alert driver, enter limp mode
+    end note
+    deactivate DiagAgent
+end
+
+== Duplicate DTC Suppression (Idempotency) ==
+
+DiagAgent -> DiagAgent: Check deduplication cache\n(key: dtc_code + first_occurrence)
+activate DiagAgent
+
+alt DTC Already Reported (Duplicate)
+    DiagAgent -> DiagAgent: Compare timestamps and occurrence count
+
+    alt Occurrence Count Increased
+        DiagAgent -> DiagAgent: Update occurrence count only
+        note right #SUCCESS_COLOR
+          Smart deduplication:
+          - Same DTC, new occurrence
+          - Update count: 3 → 4
+          - No full republish
+          Bandwidth savings: 95%
+        end note
+
+    else Same Occurrence, No Changes
+        DiagAgent -> DiagAgent: Suppress duplicate report
+        DiagAgent -> Monitor: DEBUG: Duplicate DTC suppressed\n(dtc_code, last_reported)
+        note right #SUCCESS_COLOR
+          FMEA: Duplicate Suppression Working
+          - Prevents cloud spam
+          - Reduces MQTT messages by 80%
+          - Cache TTL: 24 hours
+        end note
+        deactivate DiagAgent
+        [-> DiagAgent: No action, continue monitoring
+
+    end
+
+else New DTC (Not in Cache)
+    DiagAgent -> DiagAgent: Add to cache with TTL 24h
+    note right
+      Cache entry: {
+        dtc_code: "P0171",
+        first_occurrence: 1728432000,
+        last_reported: 1728518400,
+        report_count: 1
+      }
+    end note
+end
+
+== MQTT Publishing Phase ==
+
+DiagAgent -> DiagAgent: Build DTCReport protobuf message
+note right
+  **DTCReport Structure**
+  - report_id: UUID
+  - timestamp: EPOCH ms
+  - report_type: ACTIVE_DTCS
+  - dtcs: [DiagnosticTroubleCode]
+  - total_dtc_count: 1
+  - source_ecu: "ECM-001"
+  - mileage_km: 125430
+  - metadata: MessageMetadata
+end note
+
+DiagAgent -> MQTTClient: Publish DTCReport\n(QoS: 1, Retain: false)
+activate MQTTClient
+
+MQTTClient -> MQTTClient: Serialize to protobuf\n(Compression: ZSTD, Size: 842 bytes)
+note right
+  **Message Optimization**
+  - JSON size: 2.4 KB
+  - Protobuf size: 1.2 KB (50% reduction)
+  - ZSTD compression: 842 bytes (30% further)
+  Total savings: 65%
+end note
+
+MQTTClient -> IoTCore: PUBLISH\nTopic: v2c/v1/us-east-1/VIN-1HGBH41JXMN109186/diagnostics/dtc\nQoS: 1\nPayload: <protobuf binary>
+activate IoTCore
+
+alt MQTT Publish Success (QoS 1 ACK)
+    IoTCore -> MQTTClient: PUBACK (packet_id: 42)
+    deactivate MQTTClient
+
+    DiagAgent -> Monitor: INFO: DTC report published\n(report_id, dtc_code, severity)
+    deactivate DiagAgent
+
+    note right #SUCCESS_COLOR
+      **QoS 1 Guarantee**
+      - At-least-once delivery
+      - ACK timeout: 5s
+      - Automatic retry if no ACK
+      Success rate: 99.97%
+    end note
+
+else MQTT Connection Lost
+    MQTTClient -> MQTTClient: Detect connection failure\n(Keep-Alive timeout: 300s)
+    MQTTClient -> MQTTClient: Reconnect with exponential backoff
+
+    alt Reconnect Successful
+        MQTTClient -> IoTCore: CONNECT (clean_session: false, session_expiry: 3600s)
+        IoTCore --> MQTTClient: CONNACK (session_present: true)
+
+        MQTTClient -> MQTTClient: Resume session, redeliver unacked messages
+        MQTTClient -> IoTCore: PUBLISH (DTC report, dup: true)
+        IoTCore -> MQTTClient: PUBACK
+        deactivate MQTTClient
+
+        note right #SUCCESS_COLOR
+          FMEA: Connection Recovery Successful
+          - Persistent session preserved
+          - No message loss
+          - Automatic redelivery
+          MTTR: 2-10 seconds
+        end note
+
+    else Reconnect Failed (All Retries Exhausted)
+        MQTTClient -> DiagAgent: ERROR: Cannot connect to IoT Core
+        DiagAgent -> DiagAgent: Store DTC in local persistent queue\n(SQLite database)
+        DiagAgent -> Monitor: CRITICAL: MQTT connection failure\n(vehicle_id, retry_count, duration)
+
+        note right #FAILURE_COLOR
+          FMEA: Prolonged Connectivity Loss
+          Severity: 7 (delayed diagnostics)
+          Occurrence: 3 (network outages)
+          Detection: 2 (immediate monitoring alert)
+          RPN: 42 (Low-Medium - acceptable)
+          Mitigation:
+          - Local storage: 1000 DTCs max
+          - Sync on reconnect
+          - Alert if queue >75% full
+        end note
+
+        deactivate MQTTClient
+        deactivate DiagAgent
+        [-> DiagAgent: Retry on next network availability
+    end
+
+else MQTT Message Too Large (>128KB)
+    IoTCore --> MQTTClient: DISCONNECT (reason_code: 0x95, reason: "Packet too large")
+    MQTTClient -> DiagAgent: ERROR: Message size exceeded
+
+    DiagAgent -> DiagAgent: Split DTCReport into chunks
+    DiagAgent -> MQTTClient: Publish chunk 1/3
+    DiagAgent -> MQTTClient: Publish chunk 2/3
+    DiagAgent -> MQTTClient: Publish chunk 3/3
+
+    note right #WARNING_COLOR
+      FMEA: Message Size Limit
+      Severity: 4 (impacts delivery)
+      Occurrence: 1 (very rare, 100+ DTCs)
+      Detection: 3 (broker disconnects)
+      RPN: 12 (Very Low - acceptable)
+      Mitigation: Chunking protocol
+    end note
+
+else MQTT Throttled (Rate Limit)
+    IoTCore --> MQTTClient: ERROR: Rate limit exceeded (100 msgs/sec)
+    MQTTClient -> DiagAgent: Throttled, back off
+
+    DiagAgent -> DiagAgent: Enqueue for delayed retry\n(Exponential backoff: 1s, 2s, 4s...)
+    DiagAgent -> Monitor: WARNING: MQTT throttling detected
+
+    note right #WARNING_COLOR
+      FMEA: MQTT Rate Limiting
+      Severity: 3 (delays reporting)
+      Occurrence: 2 (during mass DTC events)
+      Detection: 2 (immediate error code)
+      RPN: 12 (Very Low - acceptable)
+      Mitigation: Queue and batch
+    end note
+end
+
+== Cloud Processing Phase (Lambda DTC Processor) ==
+
+IoTCore -> DTCProcessor: Invoke Lambda\n(Event: MQTT message, Source: IoT Rule)
+activate DTCProcessor
+
+DTCProcessor -> DTCProcessor: Deserialize protobuf\n(Validation: schema compliance)
+
+alt Protobuf Deserialization Success
+    DTCProcessor -> DTCProcessor: Extract DTC details:\n- Code: P0171\n- Severity: MEDIUM\n- Category: POWERTRAIN\n- Freeze Frame: {...}
+
+else Protobuf Deserialization Failure
+    DTCProcessor -> Monitor: ERROR: Invalid protobuf format\n(message_id, vehicle_id, error_details)
+    DTCProcessor -> DLQ: Send to DLQ for manual review
+
+    note right #FAILURE_COLOR
+      FMEA: Protobuf Parsing Failure
+      Severity: 5 (message lost)
+      Occurrence: 1 (very rare)
+      Detection: 1 (immediate parsing error)
+      RPN: 5 (Very Low - acceptable)
+      Mitigation: DLQ + manual replay
+    end note
+
+    deactivate DTCProcessor
+    [-> Engineer: Review DLQ messages
+end
+
+== DTC History Storage (DynamoDB) ==
+
+DTCProcessor -> DTCHistory: BEGIN Transaction\nPutItem {vehicle_id, dtc_code, timestamp, ...}
+activate DTCHistory
+
+alt DynamoDB Write Success
+    DTCHistory --> DTCProcessor: SUCCESS\n(Latency: 12ms, ConsumedCapacity: 1 WCU)
+
+    note right #SUCCESS_COLOR
+      **DynamoDB Schema**
+      PK: vehicle_id
+      SK: dtc_code#timestamp
+      GSI: dtc_code (query by code)
+      TTL: 5 years (compliance)
+
+      **Performance**
+      - P50: 8ms
+      - P99: 45ms
+      Success rate: 99.99%
+    end note
+
+else DynamoDB Write Failure (Throttling)
+    DTCHistory --> DTCProcessor: ERROR: ProvisionedThroughputExceededException
+
+    DTCProcessor -> DTCProcessor: Retry with exponential backoff\n(Attempt 1/5, delay 100ms)
+
+    alt Retry Successful
+        DTCHistory --> DTCProcessor: SUCCESS (after retry)
+        DTCProcessor -> Monitor: WARNING: DynamoDB throttling\n(table, consumed_capacity)
+
+    else All Retries Failed
+        DTCProcessor -> Monitor: CRITICAL: DynamoDB write failure\n(vehicle_id, dtc_code, retry_count)
+        DTCProcessor -> DLQ: Send to DLQ for replay
+
+        note right #FAILURE_COLOR
+          FMEA: DynamoDB Persistent Failure
+          Severity: 6 (data loss potential)
+          Occurrence: 2 (capacity planning issue)
+          Detection: 2 (immediate error)
+          RPN: 24 (Low - acceptable)
+          Mitigation:
+          - Auto-scaling (target: 70% utilization)
+          - On-demand mode for spikes
+          - DLQ replay
+        end note
+
+        deactivate DTCHistory
+        deactivate DTCProcessor
+        [-> Engineer: Investigate DynamoDB capacity
+    end
+
+else DynamoDB Unavailable (Service Outage)
+    DTCHistory --> DTCProcessor: ERROR: ServiceUnavailable (500)
+    DTCProcessor -> Monitor: CRITICAL: DynamoDB service outage
+    DTCProcessor -> DLQ: Send to DLQ
+
+    note right #FAILURE_COLOR
+      FMEA: DynamoDB Service Outage
+      Severity: 8 (complete data loss)
+      Occurrence: 1 (AWS incident)
+      Detection: 1 (immediate error)
+      RPN: 8 (Very Low - acceptable)
+      Mitigation: Multi-region replication
+    end note
+
+    deactivate DTCHistory
+    deactivate DTCProcessor
+end
+
+== DTC Historical Analysis (Correlation) ==
+
+DTCProcessor -> DTCHistory: QUERY\nGet last 30 days of DTCs for vehicle\n(vehicle_id = VIN-1HGBH41JXMN109186)
+activate DTCHistory
+
+DTCHistory --> DTCProcessor: Result: 7 DTCs in last 30 days\n[P0171 (3x), P0174 (2x), C0040 (1x), P0420 (1x)]
+deactivate DTCHistory
+
+DTCProcessor -> DTCProcessor: Analyze DTC patterns:\n- P0171 recurring (3x in 10 days)\n- P0174 related (same bank)\n- Pattern: Fuel trim issue
+note right
+  **Historical Correlation**
+  - Same DTC family: P017x (lean condition)
+  - Freeze frame deltas
+  - Mileage progression
+  - Seasonal patterns
+  - Correlated DTCs (cascading failures)
+end note
+
+== Predictive Maintenance (ML Inference) ==
+
+DTCProcessor -> MLService: POST /predict\n{vehicle_id, dtc_code, freeze_frame, history}
+activate MLService
+
+alt ML Inference Success
+    MLService -> MLService: Load model: Predictive Maintenance v2.3\n(SageMaker endpoint, instance: ml.m5.xlarge)
+
+    MLService -> MLService: Feature engineering:\n- DTC frequency (3/30 days = 0.1)\n- Mileage delta (500 km since last)\n- Freeze frame anomalies (fuel trim +15%)\n- Historical patterns (P0171 + P0174 = MAF sensor)
+
+    MLService -> MLService: Run inference\n(Model: XGBoost, Latency: 120ms)
+
+    MLService --> DTCProcessor: Prediction:\n{\n  failure_probability: 78%,\n  affected_component: "Mass Airflow Sensor",\n  remaining_life_km: 350,\n  remaining_days: 14,\n  confidence: 0.92\n}
+    deactivate MLService
+
+    note right #SUCCESS_COLOR
+      **ML Model Performance**
+      - Accuracy: 89%
+      - Precision: 87%
+      - Recall: 91%
+      - F1 Score: 0.89
+      - Training data: 2M DTCs
+      - Last trained: 2025-09-15
+    end note
+
+else ML Inference Timeout (>10s)
+    MLService --> DTCProcessor: ERROR: Timeout (504 Gateway Timeout)
+
+    DTCProcessor -> DTCProcessor: Use fallback: Rule-based prediction
+    DTCProcessor -> Monitor: WARNING: ML inference timeout\n(vehicle_id, dtc_code, duration: 10s)
+
+    note right #WARNING_COLOR
+      FMEA: ML Inference Timeout
+      Severity: 4 (reduced accuracy)
+      Occurrence: 3 (model latency spike)
+      Detection: 2 (timeout monitoring)
+      RPN: 24 (Low - acceptable)
+      Mitigation:
+      - Rule-based fallback (80% accuracy)
+      - Model optimization
+      - Multi-endpoint (A/B)
+    end note
+
+    DTCProcessor -> DTCProcessor: Fallback prediction:\n{\n  component: "Fuel System",\n  urgency: MEDIUM,\n  confidence: 0.65\n}
+
+else ML Service Unavailable
+    MLService --> DTCProcessor: ERROR: 503 Service Unavailable
+
+    DTCProcessor -> Monitor: CRITICAL: ML service outage
+    DTCProcessor -> DTCProcessor: Use rule-based prediction only
+
+    note right #FAILURE_COLOR
+      FMEA: ML Service Outage
+      Severity: 5 (degraded predictions)
+      Occurrence: 2 (deployment/scaling issues)
+      Detection: 1 (immediate error)
+      RPN: 10 (Very Low - acceptable)
+      Mitigation: Rule-based backup
+    end note
+
+else ML Model Inference Error
+    MLService --> DTCProcessor: ERROR: Prediction failed (invalid input)
+    DTCProcessor -> Monitor: ERROR: ML model error\n(vehicle_id, dtc_code, error_message)
+    DTCProcessor -> DLQ: Send for data science review
+
+    note right #FAILURE_COLOR
+      FMEA: ML Model Error
+      Severity: 4 (prediction unavailable)
+      Occurrence: 2 (edge case data)
+      Detection: 3 (error logged)
+      RPN: 24 (Low - acceptable)
+      Mitigation: Model retraining
+    end note
+end
+
+== Service Recommendation Engine ==
+
+DTCProcessor -> ServiceReco: GET /recommend\n{dtc_code, prediction, vehicle_model, mileage}
+activate ServiceReco
+
+ServiceReco -> ServiceReco: Load business rules:\n- DTC: P0171 → MAF sensor replacement\n- Labor: 0.5 hours\n- Part cost: $150-$300\n- Urgency: Service within 500 km
+note right
+  **Recommendation Database**
+  - 5000+ DTC → Service mappings
+  - OEM-specific repair procedures
+  - Part compatibility matrix
+  - Labor time standards
+  - Regional pricing (US, EU, APAC)
+end note
+
+ServiceReco -> ServiceReco: Find authorized dealers within 25 km\n(Vehicle location: 37.7749°N, 122.4194°W)
+
+ServiceReco --> DTCProcessor: Recommendations:\n[\n  {\n    service: "Replace Mass Airflow Sensor",\n    part_number: "OEM-MAF-2023-X",\n    labor_hours: 0.5,\n    estimated_cost: $225,\n    urgency: MEDIUM,\n    dealers: [dealer_1, dealer_2, dealer_3]\n  }\n]
+deactivate ServiceReco
+
+alt Service Recommendation Success
+    note right #SUCCESS_COLOR
+      Recommendation quality:
+      - Match rate: 94%
+      - Customer acceptance: 67%
+      - Revenue per DTC: $180
+    end note
+
+else Service Recommendation Unavailable
+    ServiceReco --> DTCProcessor: ERROR: 503 Service Unavailable
+    DTCProcessor -> DTCProcessor: Use generic recommendation:\n"Schedule diagnostic inspection"
+    DTCProcessor -> Monitor: WARNING: Service recommendation service down
+
+    note right #WARNING_COLOR
+      FMEA: Recommendation Service Down
+      Severity: 3 (generic advice only)
+      Occurrence: 2 (service deployment)
+      Detection: 2 (immediate error)
+      RPN: 12 (Very Low - acceptable)
+      Mitigation: Cached recommendations
+    end note
+end
+
+== DTC Severity-Based Routing (Critical Path) ==
+
+DTCProcessor -> DTCProcessor: Evaluate DTC severity: MEDIUM
+
+alt Severity: CRITICAL (Do Not Drive)
+    DTCProcessor -> Towing: POST /dispatch\n{vehicle_id, location, dtc_code, urgency: CRITICAL}
+    activate Towing
+
+    Towing -> Towing: Find nearest towing provider\n(Response time <30 min, 24/7 available)
+    Towing --> DTCProcessor: Towing dispatched:\n{\n  provider: "AAA Towing",\n  eta_minutes: 22,\n  driver_phone: "+1-415-555-0199",\n  case_id: "TOW-2025-4521"\n}
+    deactivate Towing
+
+    DTCProcessor -> Notification: SEND URGENT:\n- Push notification (high priority)\n- SMS (immediate)\n- Voice call (if no response in 2 min)
+
+    note right #CRITICAL_COLOR
+      **CRITICAL DTC Examples**
+      - P0601: ECU internal error
+      - P0850: Park/Neutral switch failure
+      - C1288: Brake pressure sensor fault
+      - U0100: Lost communication with ECU
+
+      Actions:
+      1. Immediate towing dispatch
+      2. Multi-channel notifications
+      3. Disable remote start
+      4. Alert OEM support center
+    end note
+
+    DTCProcessor -> Monitor: ALERT: CRITICAL DTC detected\n(vehicle_id, dtc_code, towing_dispatched)
+
+    alt Towing Dispatch Failure
+        Towing --> DTCProcessor: ERROR: No available tow trucks
+        DTCProcessor -> Notification: ESCALATE:\n- Display emergency roadside number\n- Send alternative towing providers
+        DTCProcessor -> Monitor: CRITICAL: Towing dispatch failed
+
+        note right #FAILURE_COLOR
+          FMEA: Towing Unavailable
+          Severity: 9 (stranded driver)
+          Occurrence: 1 (rare, peak demand)
+          Detection: 2 (API error)
+          RPN: 18 (Low - acceptable)
+          Mitigation: Multi-provider network
+        end note
+    end
+
+else Severity: HIGH (Service Immediately)
+    DTCProcessor -> Notification: SEND HIGH PRIORITY:\n- Push notification\n- Email\n- In-vehicle display alert
+
+    note right #WARNING_COLOR
+      **HIGH DTC Examples**
+      - P0300: Random misfire
+      - P0420: Catalyst efficiency below threshold
+      - C0050: Right rear wheel speed sensor
+      - B1318: Low battery voltage
+
+      Actions:
+      1. Push notification within 5 min
+      2. Service booking link
+      3. Dealer recommendations
+      4. Max driving range: 100 km
+    end note
+
+else Severity: MEDIUM (Service Soon)
+    DTCProcessor -> Notification: SEND NORMAL PRIORITY:\n- Push notification (next app open)\n- Email (daily digest)
+
+    note right
+      MEDIUM DTCs:
+      - Schedule within 500 km
+      - Non-urgent repairs
+      - No immediate safety risk
+      - Example: P0171 (lean condition)
+    end note
+
+else Severity: LOW or INFO
+    DTCProcessor -> DTCProcessor: Log only, no immediate notification
+    DTCProcessor -> DTCHistory: Update DTC record (notification: false)
+
+    note right
+      LOW/INFO DTCs:
+      - Schedule at next service
+      - Informational only
+      - No customer notification
+      - Example: B1234 (lamp circuit)
+    end note
+end
+
+== Warranty Claim Integration ==
+
+DTCProcessor -> Warranty: POST /validate\n{vehicle_id, dtc_code, mileage, warranty_number}
+activate Warranty
+
+alt Warranty Active and Covers DTC
+    Warranty --> DTCProcessor: {\n  covered: true,\n  warranty_type: "Powertrain",\n  expires: "2026-05-15",\n  claim_id: "WC-2025-8821",\n  coverage_percent: 100\n}
+    deactivate Warranty
+
+    DTCProcessor -> Notification: Include in notification:\n"Repair covered under warranty (100%)"
+
+    note right #SUCCESS_COLOR
+      Warranty validation:
+      - Real-time coverage check
+      - Pre-approved claim
+      - Zero customer cost
+      - Dealer reimbursement automatic
+    end note
+
+else Warranty Expired or Not Covered
+    Warranty --> DTCProcessor: {\n  covered: false,\n  reason: "Wear and tear item",\n  customer_cost_estimate: $225\n}
+    deactivate Warranty
+
+    DTCProcessor -> Notification: Include in notification:\n"Estimated repair cost: $225 (not covered)"
+
+else Warranty Service Timeout (>15s)
+    Warranty --> DTCProcessor: ERROR: Timeout
+    DTCProcessor -> DTCProcessor: Skip warranty check, proceed with notification
+    DTCProcessor -> Monitor: WARNING: Warranty service timeout
+
+    note right #WARNING_COLOR
+      FMEA: Warranty Service Timeout
+      Severity: 3 (missing info)
+      Occurrence: 3 (API latency)
+      Detection: 2 (timeout monitoring)
+      RPN: 18 (Low - acceptable)
+      Mitigation: Async retry, cache results
+    end note
+end
+
+== Customer Notification Delivery ==
+
+DTCProcessor -> Notification: Send Multi-Channel Notification\n{vehicle_id, owner_id, dtc_summary, recommendations, urgency}
+activate Notification
+
+Notification -> Notification: Load owner preferences:\n- Push: enabled\n- Email: enabled\n- SMS: critical only\n- Language: en-US
+note right
+  **Notification Preferences**
+  - Per-channel opt-in
+  - Quiet hours: 22:00-08:00
+  - Frequency limits: Max 3/day
+  - Language: 15 languages supported
+end note
+
+== Push Notification (FCM) ==
+Notification -> Notification: Send Push Notification (FCM)
+activate Notification
+
+alt Push Notification Success
+    Notification -> Notification: FCM delivery successful\n(Token: fcm-token-abc123, MessageID: 0:1728518400)
+    note right #SUCCESS_COLOR
+      Push notification:
+      - Delivery rate: 95%
+      - P50 latency: 2s
+      - P99 latency: 8s
+      - Opens: 42%
+    end note
+
+else Push Notification Failure (Invalid Token)
+    Notification -> Notification: FCM error: Invalid registration token
+    Notification -> Notification: Mark token as invalid, remove from DB
+    Notification -> Monitor: WARNING: Invalid FCM token\n(owner_id, token)
+
+    note right #WARNING_COLOR
+      FMEA: Invalid Push Token
+      Severity: 4 (notification not delivered)
+      Occurrence: 4 (app reinstall, token rotation)
+      Detection: 1 (FCM immediate error)
+      RPN: 16 (Low - acceptable)
+      Mitigation: Fallback to email/SMS
+    end note
+
+else Push Notification Failure (FCM Service Down)
+    Notification -> Notification: FCM error: Service unavailable
+    Notification -> Notification: Retry with exponential backoff (3 attempts)
+
+    alt Retry Successful
+        Notification -> Notification: Push delivered after retry
+    else All Retries Failed
+        Notification -> Monitor: CRITICAL: FCM service outage
+        Notification -> Notification: Fallback to SMS
+
+        note right #FAILURE_COLOR
+          FMEA: FCM Service Outage
+          Severity: 6 (delayed notification)
+          Occurrence: 1 (rare, Google incident)
+          Detection: 1 (immediate error)
+          RPN: 6 (Very Low - acceptable)
+          Mitigation: Multi-channel delivery
+        end note
+    end
+end
+
+deactivate Notification
+
+== Email Notification (SES) ==
+Notification -> Notification: Send Email (AWS SES)
+
+alt Email Delivery Success
+    Notification -> Notification: SES accepted (MessageID: 01000192...)
+    note right #SUCCESS_COLOR
+      Email notification:
+      - Delivery rate: 99.2%
+      - Bounce rate: 0.5%
+      - Open rate: 38%
+      - Template: Responsive HTML
+    end note
+
+else Email Delivery Failure (Bounce)
+    Notification -> Notification: SES bounce notification received
+    Notification -> Notification: Update email status: bounced
+    Notification -> Monitor: INFO: Email bounced\n(owner_id, email, bounce_type: permanent)
+
+    note right #WARNING_COLOR
+      FMEA: Email Bounce
+      Severity: 3 (notification not delivered)
+      Occurrence: 3 (invalid email)
+      Detection: 3 (bounce notification, delayed)
+      RPN: 27 (Low - acceptable)
+      Mitigation: Request email update
+    end note
+
+else Email Delivery Failure (SES Throttling)
+    Notification -> Notification: SES throttling: Rate limit exceeded
+    Notification -> Notification: Enqueue for delayed retry (5 min)
+    Notification -> Monitor: WARNING: SES throttling
+
+    note right #WARNING_COLOR
+      FMEA: SES Throttling
+      Severity: 2 (delayed notification)
+      Occurrence: 2 (high volume events)
+      Detection: 1 (immediate error)
+      RPN: 4 (Very Low - acceptable)
+      Mitigation: Increase SES sending rate
+    end note
+end
+
+== SMS Notification (SNS) ==
+alt Severity CRITICAL or HIGH
+    Notification -> Notification: Send SMS (AWS SNS)
+
+    alt SMS Delivery Success
+        Notification -> Notification: SNS accepted (MessageID: sms-abc123)
+        note right #SUCCESS_COLOR
+          SMS notification:
+          - Delivery rate: 97%
+          - P50 latency: 4s
+          - P99 latency: 15s
+          - Cost: $0.00645 per SMS (US)
+        end note
+
+    else SMS Delivery Failure (Invalid Number)
+        Notification -> Notification: SNS error: Invalid phone number
+        Notification -> Monitor: WARNING: Invalid phone number\n(owner_id, phone)
+        note right #WARNING_COLOR
+          FMEA: Invalid Phone Number
+          Severity: 5 (critical notification not delivered)
+          Occurrence: 2 (outdated contact info)
+          Detection: 1 (immediate error)
+          RPN: 10 (Very Low - acceptable)
+          Mitigation: Request phone update
+        end note
+
+    else SMS Delivery Failure (SNS Down)
+        Notification -> Notification: SNS error: Service unavailable
+        Notification -> Notification: Retry (3 attempts, 10s delay)
+
+        alt Retry Successful
+            Notification -> Notification: SMS delivered after retry
+        else All Retries Failed
+            Notification -> Monitor: CRITICAL: SNS service outage
+            Notification -> DLQ: Send to DLQ for manual retry
+
+            note right #FAILURE_COLOR
+              FMEA: SNS Service Outage
+              Severity: 7 (critical notification not delivered)
+              Occurrence: 1 (rare, AWS incident)
+              Detection: 1 (immediate error)
+              RPN: 7 (Very Low - acceptable)
+              Mitigation: Multi-channel redundancy
+            end note
+        end
+    end
+else Severity MEDIUM, LOW, INFO
+    Notification -> Notification: Skip SMS (per user preference)
+end
+
+Notification --> DTCProcessor: Notification delivery report:\n{\n  push: SUCCESS,\n  email: SUCCESS,\n  sms: SUCCESS,\n  delivered_at: 1728518450\n}
+deactivate Notification
+
+DTCProcessor -> Monitor: INFO: DTC processing complete\n(report_id, dtc_code, severity, processing_time: 2.8s)
+
+DTCProcessor -> DTCHistory: UPDATE\nSet notification_sent=true, notification_channels=['push','email','sms']
+activate DTCHistory
+DTCHistory --> DTCProcessor: Updated
+deactivate DTCHistory
+
+deactivate DTCProcessor
+
+== Owner Receives Notification ==
+
+Notification -> Owner: Push Notification:\n"Vehicle Maintenance Alert\nDTC P0171 detected: Engine running lean.\nService recommended within 500 km.\nTap for details."
+activate Owner
+
+Owner -> Owner: Open mobile app
+Owner -> Owner: View DTC details:\n- Code: P0171\n- Description: System too lean (Bank 1)\n- Severity: Medium\n- Recommended action: Replace MAF sensor\n- Estimated cost: $225\n- Nearest dealers: [3 options]
+Owner -> Owner: Tap "Schedule Service"
+note right
+  **Mobile App Features**
+  - DTC history (last 5 years)
+  - Freeze frame data visualization
+  - Service recommendations
+  - Dealer booking integration
+  - Warranty status
+  - Estimated repair costs
+end note
+
+deactivate Owner
+
+== DTC Clear/Resolution Tracking ==
+
+note over Owner, DTCProcessor
+  **DTC Resolution Flow (Separate Sequence)**
+
+  After service completed:
+  1. Dealer clears DTC via diagnostic tool
+  2. Vehicle reports DTC CLEARED status
+  3. Cloud updates DTC record: status=CLEARED
+  4. Owner notification: "Service complete, issue resolved"
+  5. ML model feedback: Prediction accuracy validation
+
+  If DTC recurs within 30 days:
+  1. Flag as persistent issue
+  2. Escalate to OEM engineering
+  3. Warranty extension consideration
+end note
+
+== Monitoring and Alerting ==
+
+Monitor -> Monitor: Aggregate DTC metrics every 60s
+note right
+  **Real-Time Metrics**
+  - DTC reports/min: 1,250
+  - Processing latency P99: 2.8s
+  - Error rate: 0.3%
+  - ML inference success: 97%
+  - Notification delivery: 96%
+  - DynamoDB latency P99: 45ms
+  - Lambda throttles: 0
+end note
+
+alt Error Rate > 5%
+    Monitor -> Monitor: Trigger PagerDuty alert: P1 incident
+    Monitor -> Engineer: Alert: "DTC processing error rate spike (8.2%)"
+    activate Engineer
+
+    Engineer -> Monitor: Query recent errors (CloudWatch Insights)
+    Monitor --> Engineer: Top errors:\n- DynamoDB throttling (60%)\n- ML timeout (30%)\n- Protobuf parse error (10%)
+
+    Engineer -> DTCHistory: Increase provisioned capacity (10 → 50 WCU)
+    Engineer -> MLService: Redeploy with larger instance (ml.m5.xlarge → ml.m5.2xlarge)
+
+    note right
+      **Incident Response**
+      - P1: <15 min response
+      - P2: <1 hour response
+      - Root cause analysis: 24 hours
+      - Postmortem: 7 days
+    end note
+
+    deactivate Engineer
+
+else Notification Delivery < 90%
+    Monitor -> Monitor: Trigger alert: Notification delivery degradation
+    Monitor -> Engineer: Alert: "Notification delivery: 87% (threshold: 90%)"
+    activate Engineer
+
+    Engineer -> Notification: Check FCM/SES/SNS status
+    Engineer -> Notification: Review invalid tokens (12% increase)
+    Engineer -> Engineer: Schedule: "Contact cleanup campaign"
+
+    deactivate Engineer
+
+else DTC Processing Latency P99 > 5s
+    Monitor -> Monitor: Trigger alert: Latency degradation
+    Monitor -> Engineer: Alert: "DTC processing P99: 6.2s (threshold: 5s)"
+    activate Engineer
+
+    Engineer -> DTCProcessor: Review Lambda metrics
+    Engineer -> Monitor: Identify bottleneck: ML inference (82% of latency)
+    Engineer -> MLService: Optimize model: Reduce feature count, quantization
+
+    deactivate Engineer
+
+else DLQ Message Count > 100
+    Monitor -> Monitor: Trigger alert: High DLQ backlog
+    Monitor -> Engineer: Alert: "DLQ messages: 127 (threshold: 100)"
+    activate Engineer
+
+    Engineer -> DLQ: Review poison messages
+    Engineer -> DLQ: Identify pattern: Protobuf schema mismatch (OTA rollout)
+    Engineer -> DiagAgent: Rollback OTA: Diagnostic agent firmware v2.3.1 → v2.3.0
+    Engineer -> DLQ: Replay messages (after rollback)
+
+    deactivate Engineer
+end
+
+== Manual Recovery Procedures ==
+
+note over Engineer, DLQ
+  **On-Call Runbook: DTC Processing Failure**
+
+  1. **High Error Rate**
+     - Check CloudWatch dashboard
+     - Identify error types (DynamoDB, ML, MQTT)
+     - Scale resources (Lambda concurrency, DynamoDB capacity)
+     - If ML down: Enable rule-based fallback
+
+  2. **DLQ Backlog**
+     - Query DLQ messages by error type
+     - Identify poison messages (schema mismatch, invalid data)
+     - Fix root cause (schema update, data validation)
+     - Replay DLQ messages (batch replay script)
+
+  3. **Notification Delivery Failure**
+     - Check FCM/SES/SNS service status
+     - Review invalid tokens/emails/phones
+     - Update contact info (customer outreach)
+     - Retry failed notifications
+
+  4. **ML Service Outage**
+     - Verify SageMaker endpoint health
+     - Check model deployment status
+     - Roll back to previous model version if needed
+     - Enable rule-based fallback mode
+
+  5. **CRITICAL DTC Not Processed**
+     - Manual towing dispatch (if needed)
+     - Direct customer call (if CRITICAL severity)
+     - Escalate to OEM support center
+     - Post-incident review (24 hours)
+end note
+
+== End-to-End Success Metrics ==
+
+note over ECU, Owner
+  **FMEA Success Criteria**
+
+  **Reliability**
+  - DTC detection accuracy: 99.7%
+  - Report delivery success: 99.5% (QoS 1)
+  - Processing success rate: 99.2%
+  - Notification delivery: 96%
+  - End-to-end latency P99: 8.5s
+
+  **Failure Modes Covered**
+  1. OBD-II communication failure (RPN: 32)
+  2. Freeze frame capture failure (RPN: 96)
+  3. MQTT connection loss (RPN: 42)
+  4. DynamoDB throttling (RPN: 24)
+  5. ML inference timeout (RPN: 24)
+  6. Notification delivery failure (RPN: 16)
+  7. Towing dispatch failure (RPN: 18)
+  8. Warranty service timeout (RPN: 18)
+
+  **Mitigations**
+  - Local caching (1000 DTCs, 7 days)
+  - Persistent MQTT sessions
+  - Auto-scaling (DynamoDB, Lambda)
+  - Rule-based fallback (ML)
+  - Multi-channel notifications
+  - DLQ + manual replay
+  - Circuit breaker patterns
+  - Real-time monitoring + alerting
+
+  **Business Impact**
+  - Proactive maintenance: 34% reduction in roadside breakdowns
+  - Customer satisfaction: +18 NPS points
+  - Warranty claims: 12% reduction (early detection)
+  - Average repair cost: -$145 (vs. reactive maintenance)
+  - Towing dispatches: 2,100/month (avg. ETA: 24 min)
+
+  **Compliance**
+  - ISO 21434: Threat analysis complete
+  - GDPR: PII encrypted at rest and in transit
+  - Data retention: 5 years (DynamoDB TTL)
+  - Audit logging: 100% coverage
+end note
+
+@enduml

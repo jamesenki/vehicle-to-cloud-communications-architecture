@@ -1,0 +1,1189 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define RETRY_COLOR #4ECDC4
+!define CRITICAL_COLOR #FF4757
+
+title FMEA-Ready Sequence: OTA (Over-The-Air) Update Complete Lifecycle
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 200
+
+' ===== ALL PARTICIPANTS =====
+actor "Fleet Manager" as Manager #LightBlue
+participant "OTA Management\nService\n[Campaign Orchestration]\n[Timeout: 60s]" as OTAService #LightGreen
+database "DynamoDB\n[Update Tracking]\n[GSI: vehicle_id]\n[Partition: campaign_id]" as DynamoDB #LightGray
+participant "Update Repository\n[S3 + CloudFront]\n[Presigned URLs]\n[TTL: 1 hour]" as S3 #LightYellow
+participant "HSM Signing\n[AWS CloudHSM]\n[ECC P-256]\n[FIPS 140-2 L3]" as HSM #LightPink
+queue "AWS IoT Core\n[MQTT 5.0]\n[QoS: 0,1,2]" as IoTCore #LightCyan
+participant "MQTT Client\n[Vehicle ECU]\n[Persistent Session]\n[Keep-Alive: 300s]" as MQTT #LightBlue
+participant "Vehicle Update\nAgent\n[A/B Partitions]\n[Rollback Support]" as UpdateAgent #LightGreen
+participant "Vehicle HSM/TPM\n[Signature Verify]\n[FIPS 140-2 L2+]" as VehicleHSM #LightPink
+database "Vehicle Storage\n[Flash Memory]\n[Partition A/B]\n[Required: 2x update size]" as Storage #LightGray
+participant "Vehicle Diagnostics\n[Health Checks]\n[CAN Bus Monitor]" as Diagnostics #LightSalmon
+participant "Rollback Service\n[Fleet-wide Control]\n[Emergency Stop]" as RollbackService #Orange
+participant "Monitoring\n[CloudWatch/Datadog]\n[Campaign Metrics]" as Monitor #Orange
+participant "On-Call Engineer" as Engineer #Red
+queue "Dead Letter Queue\n[Failed Updates]\n[Retention: 30d]" as DLQ #FAILURE_COLOR
+
+' ===== PHASE 1: OTA UPDATE CAMPAIGN CREATION =====
+
+== Phase 1: Update Notification (Cloud → Vehicle) ==
+
+Manager -> OTAService: Create OTA Campaign\n{update_id: "ota-2025-001", version: "2.5.1",\ntype: SECURITY_PATCH, priority: CRITICAL,\ntarget_filter: "model='Accord' AND year>=2023",\nrollout_strategy: CANARY, canary_size: 100}
+activate OTAService
+
+OTAService -> OTAService: Validate campaign parameters
+note right
+  Validation checks:
+  - Update package exists
+  - Target filter is valid SQL
+  - Rollout strategy is safe
+  - No conflicting campaigns
+end note
+
+alt Validation Failed
+    OTAService --> Manager: 400 Bad Request\n{error: "Invalid target filter"}
+    note over Manager, OTAService #FAILURE_COLOR
+      FMEA: Invalid Campaign Configuration
+      Severity: 3 (blocks deployment, no vehicle impact)
+      Occurrence: 2 (user error)
+      Detection: 1 (immediate)
+      RPN: 6 (Low)
+    end note
+    stop
+end
+
+OTAService -> S3: GET /updates/ota-2025-001/package.bin\n(Verify package exists)
+activate S3
+
+alt Package Not Found
+    S3 --> OTAService: 404 Not Found
+    deactivate S3
+    OTAService --> Manager: 400 Bad Request\n{error: "Update package not found"}
+    note over OTAService, S3 #FAILURE_COLOR
+      FMEA: Missing Update Package
+      Severity: 4 (blocks campaign)
+      Occurrence: 1 (rare, deployment error)
+      Detection: 1 (immediate)
+      RPN: 4 (Low)
+    end note
+    stop
+end
+
+S3 --> OTAService: 200 OK\n{size: 52428800, etag: "abc123", last_modified}
+deactivate S3
+
+OTAService -> HSM: Sign update metadata\n{update_id, version, size, checksum_sha256}
+activate HSM
+
+alt HSM Unavailable
+    HSM --X OTAService: Timeout (>5s)
+    deactivate HSM
+    OTAService -> Monitor: CRITICAL: HSM signing service down
+    OTAService --> Manager: 503 Service Unavailable\n{error: "Signing service unavailable"}
+    note over OTAService, HSM #CRITICAL_COLOR
+      FMEA: HSM Signing Failure
+      Severity: 9 (blocks ALL updates, security impact)
+      Occurrence: 1 (rare, HSM hardware/network issue)
+      Detection: 1 (immediate, 5s timeout)
+      RPN: 9 (Low-Medium)
+      Mitigation: Multi-region HSM, failover, health checks
+    end note
+    stop
+end
+
+HSM --> OTAService: Digital Signature (ECC P-256)\n{signature_bytes, algorithm: "ECDSA_SHA256"}
+deactivate HSM
+
+OTAService -> DynamoDB: PutItem campaigns\n{campaign_id, status: "SCHEDULED", created_at,\nrollout_strategy, target_filter, max_failures: 10}
+activate DynamoDB
+
+alt DynamoDB Write Failure
+    DynamoDB --> OTAService: 500 Internal Server Error
+    deactivate DynamoDB
+    OTAService -> OTAService: Retry with exponential backoff (3 attempts)
+
+    alt Retry Failed
+        OTAService --> Manager: 503 Service Unavailable\n{error: "Database unavailable"}
+        note over OTAService, DynamoDB #CRITICAL_COLOR
+          FMEA: Campaign Tracking Database Failure
+          Severity: 8 (blocks campaign management)
+          Occurrence: 1 (rare, AWS outage)
+          Detection: 1 (immediate)
+          RPN: 8 (Low-Medium)
+          Mitigation: DynamoDB on-demand, multi-AZ
+        end note
+        stop
+    end
+end
+
+DynamoDB --> OTAService: Item created
+deactivate DynamoDB
+
+OTAService -> DynamoDB: Query vehicles\nFilterExpression: "model='Accord' AND year>=2023"\n(Identify target vehicles)
+activate DynamoDB
+
+DynamoDB --> OTAService: 5000 vehicles matched
+deactivate DynamoDB
+
+OTAService -> OTAService: Select canary group\n(First 100 vehicles, sorted by VIN)
+
+' Notify first vehicle in canary group
+OTAService -> DynamoDB: PutItem update_status\n{vehicle_id: "VIN-1HGBH41JXMN109186",\nupdate_id, status: "NOTIFIED", notified_at: now()}
+activate DynamoDB
+DynamoDB --> OTAService: Item created
+deactivate DynamoDB
+
+OTAService -> S3: Generate presigned URL\n{key: "updates/ota-2025-001/package.bin",\nexpires_in: 3600, method: "GET"}
+activate S3
+S3 --> OTAService: Presigned URL\n(Valid for 1 hour)
+deactivate S3
+
+OTAService -> IoTCore: PUBLISH\nTopic: v2c/v1/us-east-1/VIN-1HGBH41JXMN109186/ota/available\nQoS: 2 (Exactly Once - Safety Critical)\nMessage Expiry: 86400s (24 hours)\nPayload: {update_id, version: "2.5.1", update_type: SECURITY_PATCH,\npriority: CRITICAL, size_bytes: 52428800, min_battery_level: 30,\ncan_install_while_driving: false, estimated_install_time_sec: 600,\nrelease_notes: "Critical security patch...", signature, metadata}
+activate IoTCore
+
+alt MQTT Publish Failure (QoS 2)
+    IoTCore --X OTAService: Timeout (no PUBREC)
+    OTAService -> OTAService: Retry MQTT publish\n(QoS 2 guarantees exactly-once, 3 attempts)
+
+    alt All Retries Failed
+        deactivate IoTCore
+        OTAService -> DLQ: Send notification to DLQ\n{vehicle_id, update_id, attempts: 3}
+        activate DLQ
+        DLQ --> OTAService: ACK
+        deactivate DLQ
+
+        OTAService -> DynamoDB: UpdateItem\nSET status = "FAILED", error = "MQTT unavailable"
+        activate DynamoDB
+        DynamoDB --> OTAService: Updated
+        deactivate DynamoDB
+
+        OTAService -> Monitor: ALERT: MQTT broker unavailable (P1)
+        note over OTAService, IoTCore #CRITICAL_COLOR
+          FMEA: MQTT Broker Failure (QoS 2)
+          Severity: 9 (affects ALL vehicles, safety critical)
+          Occurrence: 1 (rare, AWS IoT Core outage)
+          Detection: 1 (immediate)
+          RPN: 9 (Low-Medium)
+          Mitigation: Multi-region IoT Core, automatic failover
+          Recovery: Replay from DLQ after service restoration
+        end note
+        stop
+    end
+end
+
+IoTCore --> OTAService: PUBREC (QoS 2 phase 1)
+OTAService -> IoTCore: PUBREL (QoS 2 phase 2)
+IoTCore --> OTAService: PUBCOMP (QoS 2 complete)
+note right of IoTCore
+  QoS 2 guarantees EXACTLY ONCE delivery
+  Critical for safety-related OTA updates
+  Prevents duplicate installations
+end note
+
+IoTCore -> MQTT: PUBLISH (to vehicle)\nTopic: v2c/v1/us-east-1/VIN-1HGBH41JXMN109186/ota/available\nQoS: 2\nPayload: {OTAUpdateAvailable protobuf message}
+activate MQTT
+
+alt Vehicle Offline (Persistent Session)
+    MQTT --X MQTT: Vehicle not connected
+    IoTCore -> IoTCore: Queue message in persistent session\n(QoS 2 queued until vehicle connects)
+    note right of IoTCore
+      MQTT 5.0 Persistent Session:
+      - cleanSession: false
+      - sessionExpiryInterval: 3600s
+      - Messages queued up to 1 hour
+      - Vehicle receives on next connect
+    end note
+
+    ' Vehicle reconnects later
+    MQTT -> IoTCore: CONNECT\n{clientId: "VIN-1HGBH41JXMN109186",\ncleanSession: false}
+    IoTCore -> MQTT: CONNACK\n{sessionPresent: true}
+    IoTCore -> MQTT: Deliver queued message\n(QoS 2 flow)
+    note over MQTT #SUCCESS_COLOR
+      Offline Vehicle Handling
+      Message delivered when vehicle reconnects
+      No message loss with persistent sessions
+    end note
+end
+
+MQTT --> IoTCore: PUBREC
+IoTCore -> MQTT: PUBREL
+MQTT --> IoTCore: PUBCOMP
+deactivate IoTCore
+
+' ===== PHASE 2: VEHICLE ACCEPTS AND DOWNLOADS UPDATE =====
+
+== Phase 2: Update Acceptance and Download (Vehicle Decision) ==
+
+MQTT -> UpdateAgent: Forward OTA notification\n{update_id, version, type, priority, size, signature}
+activate UpdateAgent
+
+UpdateAgent -> UpdateAgent: Check for concurrent updates
+note right
+  Concurrent Update Prevention:
+  - Only 1 active update allowed
+  - Check if any update in progress
+  - Reject if already updating
+end note
+
+alt Concurrent Update in Progress
+    UpdateAgent -> MQTT: Reject update\n{status: REJECTED, reason: "Update already in progress"}
+    MQTT -> IoTCore: PUBLISH response\nTopic: v2c/v1/us-east-1/VIN-1HGBH41JXMN109186/ota/accept\nQoS: 1
+    activate IoTCore
+    IoTCore -> OTAService: Deliver response
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "REJECTED", reason = "CONCURRENT_UPDATE"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    note over UpdateAgent #WARNING_COLOR
+      FMEA: Concurrent Update Conflict
+      Severity: 4 (expected behavior, safe rejection)
+      Occurrence: 3 (multiple campaigns)
+      Detection: 1 (immediate)
+      RPN: 12 (Low)
+      Mitigation: Campaign coordination, scheduling
+    end note
+    stop
+end
+
+UpdateAgent -> VehicleHSM: Verify digital signature\n{signature, public_key: OTA_SIGNING_KEY,\ndata: {update_id, version, size, checksum}}
+activate VehicleHSM
+
+alt Signature Verification Failed
+    VehicleHSM --> UpdateAgent: SIGNATURE_INVALID
+    deactivate VehicleHSM
+
+    UpdateAgent -> UpdateAgent: Log security violation\n(Potential tampering detected)
+
+    UpdateAgent -> MQTT: Reject update\n{status: REJECTED, reason: "SIGNATURE_VERIFICATION_FAILED"}
+    MQTT -> IoTCore: PUBLISH response (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver response
+    deactivate IoTCore
+
+    OTAService -> Monitor: CRITICAL: Signature verification failed\n(Potential security breach)
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "REJECTED", reason = "SIGNATURE_INVALID"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    note over VehicleHSM #CRITICAL_COLOR
+      FMEA: Digital Signature Verification Failure
+      Severity: 10 (security vulnerability, prevents unauthorized updates)
+      Occurrence: 1 (rare, indicates tampering or signing error)
+      Detection: 1 (immediate, HSM verification)
+      RPN: 10 (Medium)
+      Mitigation: HSM-based signing, certificate validation
+      CRITICAL: Must alert security team immediately
+    end note
+    stop
+end
+
+VehicleHSM --> UpdateAgent: SIGNATURE_VALID\n(Authenticity confirmed)
+deactivate VehicleHSM
+
+UpdateAgent -> UpdateAgent: Check preconditions
+note right
+  Precondition Checks:
+  1. Battery level >= min_battery_level (30%)
+  2. Available storage >= 2x update size
+  3. Vehicle state (parked, ignition off)
+  4. No active DTCs blocking update
+  5. Version compatibility check
+end note
+
+alt Insufficient Battery (<30%)
+    UpdateAgent -> UpdateAgent: Read battery level: 22%
+
+    UpdateAgent -> MQTT: Defer update\n{status: DEFERRED, reason: "INSUFFICIENT_BATTERY",\nbattery_level: 22, scheduled_install_time: null}
+    MQTT -> IoTCore: PUBLISH response (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver response
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "DEFERRED", reason = "INSUFFICIENT_BATTERY"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    OTAService -> OTAService: Retry notification after 1 hour\n(Check battery level periodically)
+
+    note over UpdateAgent #WARNING_COLOR
+      FMEA: Insufficient Battery for Update
+      Severity: 6 (prevents update, protects vehicle)
+      Occurrence: 7 (common, low battery scenario)
+      Detection: 1 (immediate precondition check)
+      RPN: 42 (Medium)
+      Mitigation: Wait for charging/engine running
+      Expected behavior: Defer until conditions met
+    end note
+    stop
+
+else Insufficient Storage
+    UpdateAgent -> Storage: Check available space
+    activate Storage
+    Storage --> UpdateAgent: Available: 30MB\n(Required: 100MB for 50MB update)
+    deactivate Storage
+
+    UpdateAgent -> MQTT: Reject update\n{status: PRECONDITIONS_NOT_MET,\nreason: "INSUFFICIENT_STORAGE",\navailable_storage_bytes: 31457280, required_bytes: 104857600}
+    MQTT -> IoTCore: PUBLISH response (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver response
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "REJECTED", reason = "INSUFFICIENT_STORAGE"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    OTAService -> Monitor: Log insufficient storage\n(Vehicle may need service)
+
+    note over UpdateAgent, Storage #WARNING_COLOR
+      FMEA: Insufficient Storage Space
+      Severity: 7 (blocks update, may indicate vehicle issue)
+      Occurrence: 4 (moderate, depends on usage)
+      Detection: 1 (immediate)
+      RPN: 28 (Medium)
+      Mitigation: Log cleanup, diagnostic alert
+      Action: Recommend user to free up space
+    end note
+    stop
+
+else Vehicle Moving or Ignition On
+    UpdateAgent -> Diagnostics: Get vehicle state
+    activate Diagnostics
+    Diagnostics --> UpdateAgent: {speed: 65 km/h, ignition: true,\nparking_brake: false, is_moving: true}
+    deactivate Diagnostics
+
+    UpdateAgent -> MQTT: Defer update\n{status: DEFERRED, reason: "VEHICLE_IN_USE",\nvehicle_state: {ignition_on: true, is_moving: true}}
+    MQTT -> IoTCore: PUBLISH response (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver response
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "DEFERRED", reason = "VEHICLE_IN_USE"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    OTAService -> OTAService: Retry when vehicle is parked\n(Monitor ignition off event)
+
+    note over UpdateAgent, Diagnostics #SUCCESS_COLOR
+      FMEA: Vehicle In Use (Safe Rejection)
+      Severity: 3 (expected behavior, safety first)
+      Occurrence: 8 (common, vehicle usage pattern)
+      Detection: 1 (immediate)
+      RPN: 24 (Medium)
+      Expected: Update deferred until vehicle parked
+      Safety: Never update while driving
+    end note
+    stop
+
+else Version Incompatibility
+    UpdateAgent -> UpdateAgent: Check version compatibility\nCurrent: 1.8.0, Update: 2.5.1, Min required: 2.0.0
+
+    UpdateAgent -> MQTT: Reject update\n{status: REJECTED,\nreason: "VERSION_INCOMPATIBILITY",\ncurrent_version: "1.8.0", requires: ">=2.0.0"}
+    MQTT -> IoTCore: PUBLISH response (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver response
+    deactivate IoTCore
+
+    OTAService -> Monitor: Alert: Vehicle needs intermediate update
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "REJECTED", reason = "VERSION_INCOMPATIBILITY"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    note over UpdateAgent #FAILURE_COLOR
+      FMEA: Version Incompatibility
+      Severity: 8 (blocks update, may strand vehicle on old version)
+      Occurrence: 3 (moderate, version skew in fleet)
+      Detection: 1 (immediate)
+      RPN: 24 (Medium)
+      Mitigation: Campaign should target compatible versions
+      Action: Create intermediate update campaign
+    end note
+    stop
+end
+
+' Happy path: All preconditions met
+UpdateAgent -> Diagnostics: Get vehicle state
+activate Diagnostics
+Diagnostics --> UpdateAgent: {battery_level: 85%, ignition_on: false,\nparking_brake_engaged: true, is_moving: false}
+deactivate Diagnostics
+
+UpdateAgent -> Storage: Check available space
+activate Storage
+Storage --> UpdateAgent: Available: 250MB (Required: 100MB)
+deactivate Storage
+
+UpdateAgent -> UpdateAgent: All preconditions met ✓\nReady to download
+
+UpdateAgent -> MQTT: Accept update\n{status: ACCEPTED, battery_level: 85,\navailable_storage_bytes: 262144000,\nvehicle_state: {power_state: OFF, parking_brake_engaged: true}}
+MQTT -> IoTCore: PUBLISH\nTopic: v2c/v1/us-east-1/VIN-1HGBH41JXMN109186/ota/accept\nQoS: 1
+activate IoTCore
+IoTCore -> OTAService: Deliver acceptance
+deactivate IoTCore
+
+OTAService -> DynamoDB: UpdateItem\nSET status = "ACCEPTED", accepted_at = now()
+activate DynamoDB
+DynamoDB --> OTAService: Updated
+deactivate DynamoDB
+
+OTAService -> DynamoDB: PutItem download_tracking\n{vehicle_id, update_id, status: "DOWNLOAD_INITIATED"}
+activate DynamoDB
+DynamoDB --> OTAService: Item created
+deactivate DynamoDB
+
+' Begin download
+UpdateAgent -> UpdateAgent: Begin download\n{url: presigned_s3_url, chunk_size: 1MB,\nsupports_resume: true, max_time: 3600s}
+
+UpdateAgent -> S3: GET /updates/ota-2025-001/package.bin\nRange: bytes=0-1048575 (first 1MB chunk)
+activate S3
+
+alt S3 Service Unavailable
+    S3 --> UpdateAgent: 503 Service Unavailable
+    deactivate S3
+
+    UpdateAgent -> UpdateAgent: Retry with exponential backoff\n(Attempt 2, wait 5s)
+
+    UpdateAgent -> S3: GET (retry with Range header)
+    activate S3
+
+    alt Retry Success
+        S3 --> UpdateAgent: 206 Partial Content (1MB chunk)
+        deactivate S3
+    else All Retries Failed (5 attempts)
+        deactivate S3
+
+        UpdateAgent -> MQTT: Report failure\n{status: FAILED, error: "DOWNLOAD_FAILED",\nreason: "S3 unavailable", bytes_downloaded: 0}
+        MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+        activate IoTCore
+        IoTCore -> OTAService: Deliver failure
+        deactivate IoTCore
+
+        OTAService -> DynamoDB: UpdateItem\nSET status = "FAILED", error = "S3_UNAVAILABLE"
+        activate DynamoDB
+        DynamoDB --> OTAService: Updated
+        deactivate DynamoDB
+
+        OTAService -> Monitor: Alert: S3 download failures
+
+        note over S3 #FAILURE_COLOR
+          FMEA: S3 Repository Unavailable
+          Severity: 8 (blocks all downloads)
+          Occurrence: 1 (rare, AWS S3 outage)
+          Detection: 2 (after retry attempts)
+          RPN: 16 (Low-Medium)
+          Mitigation: Multi-region S3, CloudFront CDN
+        end note
+        stop
+    end
+end
+
+S3 --> UpdateAgent: 206 Partial Content\n{bytes: 0-1048575, total: 52428800}\nETag: "abc123"
+note right
+  HTTP Range Requests for Resume:
+  - Download in 1MB chunks
+  - Support resume after interruption
+  - Validate checksum incrementally
+end note
+
+UpdateAgent -> MQTT: Report progress\n{status: IN_PROGRESS, bytes_downloaded: 1048576,\ntotal_bytes: 52428800, progress_percent: 2,\nspeed_bps: 524288, eta_seconds: 800}
+MQTT -> IoTCore: PUBLISH\nTopic: v2c/v1/us-east-1/VIN-1HGBH41JXMN109186/ota/progress\nQoS: 1
+activate IoTCore
+IoTCore -> OTAService: Deliver progress (2%)
+deactivate IoTCore
+
+OTAService -> DynamoDB: UpdateItem\nSET download_progress_percent = 2, last_update = now()
+activate DynamoDB
+DynamoDB --> OTAService: Updated
+deactivate DynamoDB
+
+UpdateAgent -> S3: GET Range: bytes=1048576-2097151 (chunk 2)
+S3 --> UpdateAgent: 206 Partial Content (1MB)
+
+' Simulate download interruption
+alt Network Connection Lost (During Download)
+    UpdateAgent -> S3: GET Range: bytes=10485760-11534335 (chunk 11)
+    S3 --X UpdateAgent: Connection timeout
+    deactivate S3
+
+    UpdateAgent -> UpdateAgent: Connection lost at 10MB (20% complete)
+
+    UpdateAgent -> MQTT: Report paused\n{status: PAUSED, bytes_downloaded: 10485760,\ntotal_bytes: 52428800, progress_percent: 20}
+    MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver paused status
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "PAUSED", download_progress_percent = 20
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    note over UpdateAgent, S3 #WARNING_COLOR
+      FMEA: Network Connection Lost During Download
+      Severity: 6 (interrupts download, user frustration)
+      Occurrence: 5 (moderate, cellular coverage gaps)
+      Detection: 3 (after TCP timeout, ~30s)
+      RPN: 90 (Medium-High)
+      Mitigation: HTTP Range resume support
+      Recovery: Auto-resume when connection restored
+    end note
+
+    ' Connection restored
+    UpdateAgent -> UpdateAgent: Wait for connection (retry every 60s)
+    UpdateAgent -> UpdateAgent: Connection restored after 5 minutes
+
+    UpdateAgent -> S3: GET Range: bytes=10485760-11534335\n(Resume from last byte received)
+    activate S3
+    S3 --> UpdateAgent: 206 Partial Content (resuming)
+
+    UpdateAgent -> MQTT: Report resumed\n{status: IN_PROGRESS, bytes_downloaded: 10485760}
+    MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver resumed status
+    deactivate IoTCore
+
+    note over UpdateAgent #SUCCESS_COLOR
+      Download Resume Successful
+      No data loss, continue from last chunk
+      HTTP Range requests enable efficient recovery
+    end note
+end
+
+' Continue downloading chunks (report every 10%)
+UpdateAgent -> UpdateAgent: Continue downloading...\n(Report progress every 10%)
+
+UpdateAgent -> S3: GET Range: bytes=15728640-16777215 (chunk 16)
+S3 --> UpdateAgent: 206 Partial Content
+
+UpdateAgent -> MQTT: Report progress\n{status: IN_PROGRESS, progress_percent: 30}
+MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+activate IoTCore
+IoTCore -> OTAService: Deliver progress (30%)
+deactivate IoTCore
+
+' ... more chunks (abbreviated for diagram clarity)
+
+UpdateAgent -> S3: GET Range: bytes=52420608-52428799 (final chunk)
+S3 --> UpdateAgent: 206 Partial Content
+deactivate S3
+
+UpdateAgent -> UpdateAgent: Download complete (100%)\nTotal bytes: 52428800
+
+UpdateAgent -> UpdateAgent: Verify SHA-256 checksum\n(Expected: a3b2c1...d4e5f6)
+note right
+  Checksum Validation:
+  - Calculate SHA-256 of downloaded file
+  - Compare with signed metadata
+  - Critical security check
+  - Prevents corrupted installations
+end note
+
+alt Checksum Mismatch
+    UpdateAgent -> UpdateAgent: Checksum mismatch!\nCalculated: xxx..., Expected: a3b2c1...
+
+    UpdateAgent -> Storage: Delete corrupted file
+    activate Storage
+    Storage --> UpdateAgent: File deleted
+    deactivate Storage
+
+    UpdateAgent -> MQTT: Report failure\n{status: FAILED, error: "CHECKSUM_MISMATCH",\nprogress_percent: 100, bytes_downloaded: 52428800}
+    MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver failure
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "FAILED", error = "CHECKSUM_MISMATCH"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    OTAService -> Monitor: Alert: Checksum validation failure\n(Possible corruption or tampering)
+
+    OTAService -> OTAService: Retry download (attempt 2 of 3)
+
+    note over UpdateAgent #FAILURE_COLOR
+      FMEA: Checksum Validation Failure
+      Severity: 8 (security/integrity violation)
+      Occurrence: 2 (rare, network corruption or tampering)
+      Detection: 1 (immediate after download)
+      RPN: 16 (Low-Medium)
+      Mitigation: Retry download, investigate if persistent
+      Security: Prevents corrupted firmware installation
+    end note
+    stop
+end
+
+UpdateAgent -> UpdateAgent: Checksum valid ✓\nVerified: a3b2c1...d4e5f6
+
+UpdateAgent -> MQTT: Report download complete\n{status: COMPLETED, bytes_downloaded: 52428800,\ntotal_bytes: 52428800, progress_percent: 100}
+MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+activate IoTCore
+IoTCore -> OTAService: Deliver completion
+deactivate IoTCore
+
+OTAService -> DynamoDB: UpdateItem\nSET status = "DOWNLOADED", downloaded_at = now()
+activate DynamoDB
+DynamoDB --> OTAService: Updated
+deactivate DynamoDB
+
+OTAService -> Monitor: Metric: Download successful\n(Latency: 850s, speed: 61.7 KB/s)
+
+' ===== PHASE 3: INSTALLATION AND VERIFICATION =====
+
+== Phase 3: Installation and Verification (A/B Partition) ==
+
+UpdateAgent -> UpdateAgent: Schedule installation\n(Vehicle ignition off, parked, battery >30%)
+
+UpdateAgent -> Diagnostics: Monitor vehicle state\n(Wait for optimal installation window)
+activate Diagnostics
+Diagnostics --> UpdateAgent: Ignition off, parked, battery 85%
+deactivate Diagnostics
+
+UpdateAgent -> UpdateAgent: Begin installation\nInstall mode: IDLE (vehicle parked)
+
+UpdateAgent -> MQTT: Report installation started\n{status: STARTED, current_phase: PRE_INSTALL_CHECKS,\nprogress_percent: 0, eta_seconds: 600}
+MQTT -> IoTCore: PUBLISH\nTopic: v2c/v1/us-east-1/VIN-1HGBH41JXMN109186/ota/progress\nQoS: 1
+activate IoTCore
+IoTCore -> OTAService: Deliver install start
+deactivate IoTCore
+
+OTAService -> DynamoDB: UpdateItem\nSET status = "INSTALLING", install_started_at = now()
+activate DynamoDB
+DynamoDB --> OTAService: Updated
+deactivate DynamoDB
+
+' Pre-installation checks
+UpdateAgent -> Diagnostics: Run pre-install checks
+activate Diagnostics
+
+alt Critical DTC Found
+    Diagnostics --> UpdateAgent: FAILED: Critical DTC P0601 (ECU defective)
+    deactivate Diagnostics
+
+    UpdateAgent -> MQTT: Report failure\n{status: FAILED, error: "PRE_INSTALL_CHECK_FAILED",\nreason: "Critical DTC P0601", current_phase: PRE_INSTALL_CHECKS}
+    MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver failure
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "FAILED", error = "CRITICAL_DTC"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    note over Diagnostics #FAILURE_COLOR
+      FMEA: Critical DTC Blocks Installation
+      Severity: 7 (blocks update, indicates vehicle issue)
+      Occurrence: 2 (rare, vehicle malfunction)
+      Detection: 1 (immediate pre-check)
+      RPN: 14 (Low-Medium)
+      Mitigation: Resolve DTC before update
+      Action: Vehicle requires service
+    end note
+    stop
+end
+
+Diagnostics --> UpdateAgent: Pre-install checks passed ✓\n(No critical DTCs, CAN bus healthy, storage OK)
+deactivate Diagnostics
+
+UpdateAgent -> Storage: Identify target partition\n(Current: Partition A, Install to: Partition B)
+activate Storage
+
+alt Partition B Not Available
+    Storage --> UpdateAgent: ERROR: Partition B corrupted or locked
+    deactivate Storage
+
+    UpdateAgent -> MQTT: Report failure\n{status: FAILED, error: "PARTITION_UNAVAILABLE"}
+    MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver failure
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "FAILED", error = "PARTITION_UNAVAILABLE"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    note over Storage #CRITICAL_COLOR
+      FMEA: A/B Partition Not Available
+      Severity: 9 (prevents safe update, may brick vehicle)
+      Occurrence: 1 (rare, storage hardware failure)
+      Detection: 1 (immediate)
+      RPN: 9 (Low-Medium)
+      Mitigation: Storage diagnostics, partition repair
+      CRITICAL: Vehicle may need factory reset
+    end note
+    stop
+end
+
+Storage --> UpdateAgent: Partition B available (2GB free)
+deactivate Storage
+
+' Create backup
+UpdateAgent -> MQTT: Report progress\n{status: IN_PROGRESS, current_phase: BACKUP_CREATION,\nprogress_percent: 10}
+MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+activate IoTCore
+IoTCore -> OTAService: Deliver progress (10%)
+deactivate IoTCore
+
+UpdateAgent -> Storage: Create backup of Partition A metadata\n(Store boot flags, version info)
+activate Storage
+Storage --> UpdateAgent: Backup created
+deactivate Storage
+
+' Extract update package
+UpdateAgent -> MQTT: Report progress\n{status: IN_PROGRESS, current_phase: EXTRACTION,\nprogress_percent: 20}
+MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+activate IoTCore
+IoTCore -> OTAService: Deliver progress (20%)
+deactivate IoTCore
+
+UpdateAgent -> Storage: Extract package to Partition B\n(Decompress, verify signatures on each component)
+activate Storage
+
+alt Extraction Failed (Corrupted Archive)
+    Storage --> UpdateAgent: ERROR: Extraction failed (invalid archive)
+    deactivate Storage
+
+    UpdateAgent -> MQTT: Report failure\n{status: FAILED, error: "EXTRACTION_FAILED",\ncurrent_phase: EXTRACTION}
+    MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver failure
+    deactivate IoTCore
+
+    OTAService -> OTAService: Retry download and install (attempt 2)
+
+    note over UpdateAgent, Storage #FAILURE_COLOR
+      FMEA: Package Extraction Failure
+      Severity: 6 (blocks installation)
+      Occurrence: 2 (rare, download corruption)
+      Detection: 2 (during extraction phase)
+      RPN: 24 (Medium)
+      Mitigation: Retry download, verify package integrity
+    end note
+    stop
+end
+
+Storage --> UpdateAgent: Extraction complete (Partition B)
+deactivate Storage
+
+' Apply update
+UpdateAgent -> MQTT: Report progress\n{status: IN_PROGRESS, current_phase: APPLYING_UPDATE,\nprogress_percent: 40}
+MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+activate IoTCore
+IoTCore -> OTAService: Deliver progress (40%)
+deactivate IoTCore
+
+UpdateAgent -> Storage: Write firmware to Partition B\n(Flash memory write, sector by sector)
+activate Storage
+
+alt Flash Write Failure
+    Storage --> UpdateAgent: ERROR: Flash write failed (sector 0x4000)
+    deactivate Storage
+
+    UpdateAgent -> UpdateAgent: Mark Partition B as corrupted
+
+    UpdateAgent -> MQTT: Report failure\n{status: FAILED, error: "FLASH_WRITE_FAILED",\ncurrent_phase: APPLYING_UPDATE}
+    MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver failure
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "FAILED", error = "FLASH_WRITE_FAILED"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    OTAService -> Monitor: ALERT: Flash hardware failure\n(Vehicle may need service)
+
+    note over Storage #CRITICAL_COLOR
+      FMEA: Flash Memory Write Failure
+      Severity: 8 (hardware failure, may strand vehicle)
+      Occurrence: 1 (rare, flash memory wear/defect)
+      Detection: 2 (during write operation)
+      RPN: 16 (Low-Medium)
+      Mitigation: Partition A still bootable (no bricking)
+      Action: Vehicle requires storage hardware service
+    end note
+    stop
+end
+
+Storage --> UpdateAgent: Firmware written successfully
+deactivate Storage
+
+UpdateAgent -> MQTT: Report progress\n{status: IN_PROGRESS, current_phase: APPLYING_UPDATE,\nprogress_percent: 70}
+MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+activate IoTCore
+IoTCore -> OTAService: Deliver progress (70%)
+deactivate IoTCore
+
+' Update bootloader
+UpdateAgent -> MQTT: Report progress\n{status: IN_PROGRESS, current_phase: BOOTLOADER_UPDATE,\nprogress_percent: 80}
+MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+activate IoTCore
+IoTCore -> OTAService: Deliver progress (80%)
+deactivate IoTCore
+
+UpdateAgent -> Storage: Update boot flags\n{active_partition: B, fallback_partition: A,\nboot_attempts: 0, max_attempts: 3}
+activate Storage
+Storage --> UpdateAgent: Boot flags updated
+deactivate Storage
+
+UpdateAgent -> MQTT: Report progress\n{status: IN_PROGRESS, current_phase: REBOOTING,\nprogress_percent: 90}
+MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+activate IoTCore
+IoTCore -> OTAService: Deliver progress (90%)
+deactivate IoTCore
+
+OTAService -> DynamoDB: UpdateItem\nSET status = "REBOOTING", reboot_started_at = now()
+activate DynamoDB
+DynamoDB --> OTAService: Updated
+deactivate DynamoDB
+
+UpdateAgent -> UpdateAgent: Initiate system reboot\n(Boot from Partition B)
+deactivate UpdateAgent
+deactivate MQTT
+
+' System reboots
+note over UpdateAgent #WARNING_COLOR
+  SYSTEM REBOOT
+  Bootloader switches to Partition B
+  Vehicle offline for ~60 seconds
+end note
+
+' System comes back up on Partition B
+activate MQTT
+activate UpdateAgent
+
+UpdateAgent -> UpdateAgent: Boot from Partition B\n(New firmware version 2.5.1)
+
+UpdateAgent -> UpdateAgent: Check boot_attempts counter\n(Attempt 1 of 3)
+note right
+  Automatic Rollback Detection:
+  - Track successful boot attempts
+  - If 3 consecutive failed boots, rollback to Partition A
+  - Watchdog timer: 120 seconds per boot
+  - Prevents boot loops from bad firmware
+end note
+
+alt Boot Failure (New Firmware Crashes)
+    UpdateAgent -> UpdateAgent: Watchdog timeout (boot failed)
+    UpdateAgent -> UpdateAgent: Increment boot_attempts = 1
+    UpdateAgent -> UpdateAgent: Reboot and retry
+
+    ' Second boot attempt
+    UpdateAgent -> UpdateAgent: Boot from Partition B (Attempt 2)
+    UpdateAgent -> UpdateAgent: Watchdog timeout (boot failed again)
+    UpdateAgent -> UpdateAgent: Increment boot_attempts = 2
+    UpdateAgent -> UpdateAgent: Reboot and retry
+
+    ' Third boot attempt
+    UpdateAgent -> UpdateAgent: Boot from Partition B (Attempt 3)
+    UpdateAgent -> UpdateAgent: Watchdog timeout (3rd failure)
+    UpdateAgent -> UpdateAgent: boot_attempts = 3 (MAX EXCEEDED)
+
+    UpdateAgent -> Storage: Automatic rollback triggered\n{active_partition: A, fallback_partition: B}
+    activate Storage
+    Storage --> UpdateAgent: Boot flags reverted to Partition A
+    deactivate Storage
+
+    UpdateAgent -> UpdateAgent: Reboot from Partition A (old firmware)
+
+    ' Boot successful on old partition
+    UpdateAgent -> UpdateAgent: Boot successful (Partition A, version 2.0.0)
+
+    UpdateAgent -> MQTT: Report rollback\n{status: ROLLED_BACK, reason: "BOOT_FAILURE",\ncurrent_version: "2.0.0", failed_version: "2.5.1",\nboot_attempts: 3}
+    MQTT -> IoTCore: PUBLISH\nTopic: v2c/v1/us-east-1/VIN-1HGBH41JXMN109186/ota/progress\nQoS: 1
+    activate IoTCore
+    IoTCore -> OTAService: Deliver rollback notification
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "ROLLED_BACK", error = "BOOT_FAILURE"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    OTAService -> Monitor: CRITICAL: Update caused boot failures\n(Vehicle auto-rolled back, campaign may be defective)
+
+    OTAService -> OTAService: Check campaign failure threshold\n(Current failures: 5, Max allowed: 10)
+
+    alt Campaign Failure Threshold Exceeded
+        OTAService -> OTAService: Auto-pause campaign\n(Stop sending to remaining vehicles)
+
+        OTAService -> DynamoDB: UpdateItem campaigns\nSET status = "PAUSED", pause_reason = "FAILURE_THRESHOLD"
+        activate DynamoDB
+        DynamoDB --> OTAService: Updated
+        deactivate DynamoDB
+
+        OTAService -> Monitor: ALERT: Campaign auto-paused (P1)
+        activate Monitor
+        Monitor -> Engineer: PagerDuty: OTA campaign causing rollbacks
+        activate Engineer
+        note over Engineer #CRITICAL_COLOR
+          Manual Investigation Required:
+          1. Review update package for defects
+          2. Analyze rollback logs from affected vehicles
+          3. Identify root cause (hardware compatibility, software bug)
+          4. Decide: Fix and resume OR cancel campaign
+          5. Communicate with affected customers
+        end note
+        deactivate Engineer
+        deactivate Monitor
+    end
+
+    note over UpdateAgent, Storage #CRITICAL_COLOR
+      FMEA: Boot Failure After Update (Automatic Rollback)
+      Severity: 9 (high impact, but safe rollback prevents bricking)
+      Occurrence: 2 (rare, defective firmware package)
+      Detection: 3 (after 3 boot attempts, ~6 minutes)
+      RPN: 54 (Medium-High)
+      Mitigation: A/B partitioning, automatic rollback, watchdog
+      Recovery: Vehicle remains operational on old firmware
+      Impact: Update campaign paused, investigate defect
+    end note
+    stop
+end
+
+' Happy path: Boot successful
+UpdateAgent -> UpdateAgent: Boot successful on Partition B ✓\nVersion: 2.5.1, boot_attempts: 1
+
+UpdateAgent -> MQTT: Reconnect to AWS IoT Core\n{clientId: "VIN-1HGBH41JXMN109186"}
+MQTT -> IoTCore: CONNECT
+activate IoTCore
+IoTCore --> MQTT: CONNACK
+deactivate IoTCore
+
+UpdateAgent -> MQTT: Report installation progress\n{status: IN_PROGRESS, current_phase: POST_INSTALL_VERIFICATION,\nprogress_percent: 95}
+MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+activate IoTCore
+IoTCore -> OTAService: Deliver progress (95%)
+deactivate IoTCore
+
+' Post-installation verification
+UpdateAgent -> Diagnostics: Run post-install verification tests
+activate Diagnostics
+
+note right of Diagnostics
+  Post-Install Verification Tests:
+  1. CAN bus communication check
+  2. ECU firmware version validation
+  3. DTC scan (no new critical errors)
+  4. Sensor connectivity test
+  5. Network connectivity test
+  6. Feature smoke tests
+end note
+
+alt Verification Test Failed
+    Diagnostics --> UpdateAgent: FAILED: Test "CAN_BUS_COMMUNICATION" failed
+    deactivate Diagnostics
+
+    UpdateAgent -> UpdateAgent: Verification failed, initiate rollback
+
+    UpdateAgent -> Storage: Rollback to Partition A
+    activate Storage
+    Storage --> UpdateAgent: Boot flags reverted
+    deactivate Storage
+
+    UpdateAgent -> UpdateAgent: Reboot to Partition A
+
+    ' After rollback boot
+    UpdateAgent -> MQTT: Report rollback\n{status: ROLLED_BACK, reason: "VERIFICATION_FAILED",\ntest_failed: "CAN_BUS_COMMUNICATION"}
+    MQTT -> IoTCore: PUBLISH progress (QoS: 1)
+    activate IoTCore
+    IoTCore -> OTAService: Deliver rollback
+    deactivate IoTCore
+
+    OTAService -> DynamoDB: UpdateItem\nSET status = "ROLLED_BACK", error = "VERIFICATION_FAILED"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    OTAService -> Monitor: Alert: Verification failure, rolled back
+
+    note over Diagnostics #FAILURE_COLOR
+      FMEA: Post-Install Verification Failure
+      Severity: 8 (new firmware defective, safe rollback)
+      Occurrence: 2 (rare, firmware compatibility issue)
+      Detection: 1 (immediate verification)
+      RPN: 16 (Low-Medium)
+      Mitigation: Comprehensive verification tests, rollback
+      Recovery: Vehicle operational on old firmware
+    end note
+    stop
+end
+
+Diagnostics --> UpdateAgent: All verification tests passed ✓\n{tests_passed: 6, tests_failed: 0, duration_ms: 12000}
+deactivate Diagnostics
+
+UpdateAgent -> Storage: Mark Partition B as stable\n{boot_attempts: 0, verified: true}
+activate Storage
+Storage --> UpdateAgent: Partition B marked stable
+deactivate Storage
+
+UpdateAgent -> MQTT: Report installation complete\n{status: SUCCESS, installed_version: "2.5.1",\nprevious_version: "2.0.0", duration_seconds: 620,\nverification_results: [{test: "CAN_BUS", passed: true}, ...]}
+MQTT -> IoTCore: PUBLISH\nTopic: v2c/v1/us-east-1/VIN-1HGBH41JXMN109186/ota/progress\nQoS: 1
+activate IoTCore
+IoTCore -> OTAService: Deliver completion
+deactivate IoTCore
+
+OTAService -> DynamoDB: UpdateItem\nSET status = "COMPLETED", installed_at = now(),\ninstalled_version = "2.5.1", duration_seconds = 620
+activate DynamoDB
+DynamoDB --> OTAService: Updated
+deactivate DynamoDB
+
+OTAService -> Monitor: Metric: Update successful\n{vehicle_id, campaign_id, duration: 620s,\ndownload_time: 850s, install_time: 620s}
+
+OTAService -> OTAService: Check campaign progress\n(Canary group: 100 vehicles, Success: 98, Failed: 2)
+
+alt Canary Success Rate >= 95%
+    OTAService -> OTAService: Canary validation passed ✓\nProceed with full rollout (5000 vehicles)
+
+    OTAService -> DynamoDB: UpdateItem campaigns\nSET status = "ACTIVE", phase = "FULL_ROLLOUT"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    OTAService -> OTAService: Begin notifying remaining vehicles\n(Batched rollout: 500 vehicles per hour)
+
+    note over OTAService #SUCCESS_COLOR
+      Canary Deployment Successful
+      Success rate: 98% (acceptable)
+      Proceeding with full fleet rollout
+      Monitoring continues for anomalies
+    end note
+else Canary Failure Rate > 5%
+    OTAService -> OTAService: Canary validation FAILED\nSuccess rate: 85% (below threshold)
+
+    OTAService -> DynamoDB: UpdateItem campaigns\nSET status = "PAUSED", phase = "CANARY_FAILED"
+    activate DynamoDB
+    DynamoDB --> OTAService: Updated
+    deactivate DynamoDB
+
+    OTAService -> Monitor: ALERT: Canary deployment failed (P1)
+    activate Monitor
+    Monitor -> Engineer: PagerDuty: Campaign halted due to canary failures
+    activate Engineer
+    note over Engineer #CRITICAL_COLOR
+      Canary Failure - Manual Review Required:
+      1. Analyze failure patterns (common vehicle model/year?)
+      2. Review logs from failed vehicles
+      3. Determine if issue is widespread or edge case
+      4. Decide: Fix update package OR cancel campaign
+      5. Communicate with affected customers
+    end note
+    deactivate Engineer
+    deactivate Monitor
+
+    note over OTAService #FAILURE_COLOR
+      FMEA: Canary Deployment Failure
+      Severity: 7 (affects subset of fleet, caught early)
+      Occurrence: 3 (moderate, compatibility issues)
+      Detection: 1 (immediate after canary phase)
+      RPN: 21 (Medium)
+      Mitigation: Canary deployment strategy prevents fleet-wide impact
+      Impact: Campaign halted, only 100 vehicles affected
+    end note
+end
+
+note over Manager, UpdateAgent #SUCCESS_COLOR
+  ===== OTA UPDATE COMPLETE =====
+  Total Duration: ~25 minutes (notification to verification)
+  - Notification: 5s
+  - Download: 14 minutes (850s at 61.7 KB/s)
+  - Installation: 10 minutes (620s)
+  - Verification: 12s
+
+  Vehicle now running firmware 2.5.1
+  A/B partition preserved for future updates
+  Rollback capability maintained
+end note
+
+deactivate UpdateAgent
+deactivate MQTT
+deactivate OTAService
+
+== Monitoring and Campaign Analytics ==
+
+Monitor -> Monitor: Aggregate campaign metrics (every 5 minutes)\n- Success rate by vehicle model/year\n- Download speeds (P50/P95/P99)\n- Installation duration\n- Failure reasons breakdown\n- Rollback rate
+
+alt High Rollback Rate (>2%)
+    Monitor -> Monitor: Trigger alert: "High rollback rate detected"
+    Monitor -> Engineer: PagerDuty: Campaign showing high rollback rate
+else Download Failures (>5%)
+    Monitor -> Monitor: Trigger alert: "High download failure rate"
+    Monitor -> Engineer: Slack: Investigate network/S3 issues
+else Installation Time P95 > 15 minutes
+    Monitor -> Monitor: Trigger alert: "Slow installation times"
+    Monitor -> Engineer: Email: Review installation performance
+end
+
+== Emergency Fleet-Wide Rollback (If Critical Bug Found) ==
+
+Manager -> RollbackService: Initiate fleet-wide rollback\n{campaign_id: "ota-2025-001", reason: "CRITICAL_BUG",\ntarget_version: "2.0.0"}
+activate RollbackService
+
+RollbackService -> DynamoDB: Query vehicles with update installed\nFilterExpression: "installed_version = '2.5.1'"
+activate DynamoDB
+DynamoDB --> RollbackService: 150 vehicles found
+deactivate DynamoDB
+
+RollbackService -> RollbackService: Send rollback command to all affected vehicles
+
+loop For each vehicle (batched 50 at a time)
+    RollbackService -> IoTCore: PUBLISH\nTopic: v2c/v1/{region}/{vehicle_id}/ota/rollback\nQoS: 2 (Exactly Once)\nPayload: {update_id, reason: CRITICAL_BUG, target_version: "2.0.0"}
+    activate IoTCore
+
+    IoTCore -> MQTT: Deliver rollback command
+    activate MQTT
+
+    MQTT -> UpdateAgent: Initiate rollback
+    activate UpdateAgent
+
+    UpdateAgent -> Storage: Switch active partition to A
+    activate Storage
+    Storage --> UpdateAgent: Boot flags updated
+    deactivate Storage
+
+    UpdateAgent -> UpdateAgent: Schedule reboot
+
+    UpdateAgent -> MQTT: Acknowledge rollback\n{status: ROLLBACK_IN_PROGRESS}
+    MQTT -> IoTCore: PUBLISH response (QoS: 1)
+    IoTCore -> RollbackService: Delivery confirmed
+    deactivate IoTCore
+    deactivate MQTT
+    deactivate UpdateAgent
+
+    RollbackService -> DynamoDB: UpdateItem\nSET status = "ROLLBACK_INITIATED", rollback_at = now()
+    activate DynamoDB
+    DynamoDB --> RollbackService: Updated
+    deactivate DynamoDB
+end
+
+RollbackService -> Monitor: Metric: Fleet-wide rollback initiated\n{affected_vehicles: 150, reason: "CRITICAL_BUG"}
+
+note over RollbackService #CRITICAL_COLOR
+  FMEA: Emergency Fleet-Wide Rollback
+  Severity: 10 (critical bug affects fleet, requires immediate action)
+  Occurrence: 1 (rare, escaped defect in testing)
+  Detection: 4 (may take hours/days to discover in production)
+  RPN: 40 (Medium)
+  Mitigation: Canary deployment, extensive testing, rapid rollback capability
+  Impact: Vehicles revert to stable firmware, feature loss temporary
+  Recovery Time: ~1 hour to rollback entire fleet
+end note
+
+deactivate RollbackService
+
+@enduml

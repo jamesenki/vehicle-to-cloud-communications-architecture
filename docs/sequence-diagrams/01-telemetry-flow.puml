@@ -1,0 +1,750 @@
+@startuml
+!define FAILURE_COLOR #FF6B6B
+!define WARNING_COLOR #FFD93D
+!define SUCCESS_COLOR #6BCF7F
+!define RETRY_COLOR #4ECDC4
+
+title Complete Telemetry Flow with FMEA Coverage - Vehicle-to-Cloud Communications
+skinparam backgroundColor #FEFEFE
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 300
+
+' Define all participants with system constraints and SLAs
+actor "Vehicle ECU\n[Sampling: 1-10min]" as ECU
+participant "MQTT Client\n[Paho v5, Keep-Alive: 40min]" as MQTTClient
+participant "AWS IoT Core\n[Max Packet: 128KB, Timeout: 30s]" as IoTCore
+participant "IoT Rules Engine\n[Parallel Execution: 10]" as Rules
+participant "Lambda: Validator\n[Timeout: 15s, Memory: 512MB]" as Validator
+participant "Lambda: Processor\n[Timeout: 30s, Memory: 1GB]" as Processor
+participant "DynamoDB\n[WCU: 100, RCU: 100, Partition Key: vehicle_id]" as DynamoDB
+participant "Timestream\n[Retention: 24hrs->90d, Partition: time]" as Timestream
+database "S3: Dead Letter\n[Lifecycle: 90d]" as DLQ
+participant "CloudWatch\n[Metrics Resolution: 1min]" as CloudWatch
+participant "SNS Alerts\n[Threshold: 5 failures/min]" as SNS
+
+== Phase 1: Connection Establishment (Cold Start) ==
+
+note over ECU, CloudWatch
+**Cold Start Scenario**: Vehicle powers on, establishes connection
+**Frequency**: ~12 times per day (avg. vehicle usage)
+**Network Cost**: ~4.5KB for TLS handshake
+end note
+
+ECU -> MQTTClient: Power on, initialize MQTT client
+activate MQTTClient
+
+MQTTClient -> MQTTClient: Load certificates from HSM/TPM
+note right
+**Certificate Validation**:
+- ECC P-256 or RSA 2048-bit
+- 1-year validity
+- CN: Vehicle VIN
+- Storage: FIPS 140-2 Level 2+
+end note
+
+MQTTClient -> IoTCore: CONNECT (MQTT 5.0, Clean Session=false, Keep-Alive=2400s)
+activate IoTCore
+
+alt #SUCCESS_COLOR mTLS Certificate Valid
+    IoTCore -> IoTCore: Validate X.509 certificate chain
+    IoTCore -> IoTCore: Check certificate not revoked (OCSP/CRL)
+    IoTCore -> IoTCore: Verify CN matches registered vehicle VIN
+
+    IoTCore -> CloudWatch: Log connection event (vehicle_id, timestamp, IP)
+    IoTCore --> MQTTClient: CONNACK (Session Present=true, Max Packet=131072)
+
+    MQTTClient -> IoTCore: Subscribe to command topic with QoS 1
+    note right
+    **Topic**: v2c/v1/{region}/{vehicle_id}/command/request
+    **QoS**: 1 (at-least-once delivery)
+    **Session**: Persistent (Clean Session=false)
+    end note
+
+    IoTCore --> MQTTClient: SUBACK (QoS 1 granted)
+
+    MQTTClient -> CloudWatch: Publish connection success metric
+    note right #SUCCESS_COLOR
+    **Metric**: mqtt.connection.success
+    **Dimension**: region, vehicle_model
+    **MTBF**: 99.95% uptime SLA
+    end note
+
+else #FAILURE_COLOR Certificate Expired
+    IoTCore -> CloudWatch: CRITICAL: Certificate expired
+    IoTCore --> MQTTClient: CONNACK (Return Code: 0x86 - Bad Authentication)
+
+    MQTTClient -> MQTTClient: Trigger certificate renewal process
+    note right #FAILURE_COLOR
+    **Recovery**: Request new certificate via fallback channel (SMS)
+    **Impact**: Vehicle offline until renewal (30-60 min)
+    **Severity**: HIGH - Remote commands unavailable
+    **Detection**: Certificate expiry monitor (7-day warning)
+    end note
+
+    MQTTClient -> SNS: ALERT: Certificate renewal required for {vehicle_id}
+
+else #FAILURE_COLOR Network Timeout (>30s)
+    MQTTClient -> MQTTClient: Retry with exponential backoff
+    note right #RETRY_COLOR
+    **Retry Policy**:
+    - Attempt 1: Wait 2s
+    - Attempt 2: Wait 4s
+    - Attempt 3: Wait 8s
+    - Max Attempts: 5
+    - Max Backoff: 32s
+    end note
+
+    loop Retry up to 5 times
+        MQTTClient -> IoTCore: CONNECT (retry)
+        alt Connection Successful
+            IoTCore --> MQTTClient: CONNACK
+        else All Retries Failed
+            MQTTClient -> MQTTClient: Store telemetry locally (vehicle buffer)
+            MQTTClient -> CloudWatch: Log connection failure
+            note right #FAILURE_COLOR
+            **Fallback**: Store up to 1000 messages locally
+            **Impact**: Delayed telemetry delivery
+            **Alert**: Network connectivity issue
+            end note
+        end
+    end
+
+else #FAILURE_COLOR Rate Limit Exceeded (AWS IoT)
+    IoTCore -> CloudWatch: WARN: Connection rate limit exceeded
+    IoTCore --> MQTTClient: CONNACK (Return Code: 0x97 - Quota Exceeded)
+
+    note right #WARNING_COLOR
+    **AWS IoT Core Limits**:
+    - 500 connections/sec per account
+    - 100 subscriptions per connection
+    - Mitigation: Implement connection pooling
+    end note
+
+    MQTTClient -> MQTTClient: Wait for rate limit window reset (60s)
+end
+
+deactivate IoTCore
+
+== Phase 2A: Individual Telemetry Publishing (Real-Time) ==
+
+note over ECU, CloudWatch
+**Frequency**: Every 1-10 minutes (configurable per vehicle)
+**Topic**: v2c/v1/{region}/{vehicle_id}/telemetry/vehicle
+**Payload**: Protocol Buffers (proto3), ~200-500 bytes uncompressed
+**QoS**: 1 (at-least-once delivery with PUBACK)
+end note
+
+ECU -> ECU: Collect sensor data from CAN bus
+note right
+**Data Sources**:
+- Speed, RPM, gear position
+- Battery voltage, fuel level
+- Engine temp, oil pressure
+- GPS coordinates (if consent given)
+- Tire pressure (TPMS)
+end note
+
+ECU -> MQTTClient: Send telemetry data
+activate MQTTClient
+
+MQTTClient -> MQTTClient: Serialize to Protocol Buffers (proto3)
+MQTTClient -> MQTTClient: Generate message_id (UUID v4)
+MQTTClient -> MQTTClient: Add timestamp (EPOCH milliseconds)
+
+alt #SUCCESS_COLOR Topic Alias Optimization (96% overhead reduction)
+    MQTTClient -> MQTTClient: Use Topic Alias 1 (pre-negotiated)
+    note right #SUCCESS_COLOR
+    **Cost Savings**:
+    - Full topic: 54 bytes
+    - Topic alias: 2 bytes
+    - Savings: 52 bytes per message
+    - Annual savings (1M vehicles): $2.73M
+
+    **Configuration**:
+    - Max aliases: 10
+    - Alias mapping cached in session
+    end note
+end
+
+MQTTClient -> IoTCore: PUBLISH (Topic Alias=1, QoS=1, Payload=protobuf)
+activate IoTCore
+
+IoTCore -> IoTCore: Validate topic structure and permissions
+IoTCore -> IoTCore: Check message size < 128KB
+
+alt #SUCCESS_COLOR Message Valid and Authorized
+    IoTCore --> MQTTClient: PUBACK (Packet ID, Reason Code: 0x00 Success)
+    note right #SUCCESS_COLOR
+    **QoS 1 Guarantees**:
+    - At-least-once delivery
+    - Broker acknowledges receipt
+    - Client considers message delivered
+    **Latency P50**: <100ms, **P99**: <500ms
+    end note
+
+    IoTCore -> Rules: Trigger IoT Rules Engine
+    activate Rules
+
+    Rules -> Rules: Evaluate SQL rule: SELECT * FROM 'v2c/v1/+/+/telemetry/vehicle'
+    Rules -> Validator: Invoke validation Lambda
+    activate Validator
+
+    Validator -> Validator: Decompress payload (if compressed)
+    Validator -> Validator: Parse Protocol Buffer message
+
+    alt #SUCCESS_COLOR Protobuf Parsing Success
+        Validator -> Validator: Validate schema version compatibility
+        Validator -> Validator: Check required fields (message_id, timestamp, vehicle_id)
+        Validator -> Validator: Validate data ranges (speed < 300 km/h, battery 0-100%)
+        Validator -> Validator: Verify timestamp freshness (not > 5 min old)
+
+        Validator -> DynamoDB: Check for duplicate message_id (deduplication)
+        activate DynamoDB
+
+        alt #SUCCESS_COLOR Message ID Not Seen
+            DynamoDB --> Validator: No duplicate found
+
+            Validator -> Processor: Forward validated message
+            activate Processor
+
+            Processor -> Processor: Enrich with vehicle metadata (model, year, region)
+            Processor -> Processor: Apply business logic transformations
+
+            par Parallel Database Writes
+                Processor -> DynamoDB: Write to operational DB
+                activate DynamoDB
+
+                alt #SUCCESS_COLOR DynamoDB Write Success
+                    DynamoDB --> Processor: Write successful (ConsumedWCU: 2)
+                    note right #SUCCESS_COLOR
+                    **Partition Strategy**:
+                    - PK: vehicle_id
+                    - SK: timestamp
+                    - GSI: region-timestamp-index
+                    - TTL: 90 days
+                    end note
+
+                else #FAILURE_COLOR DynamoDB Throttling (ProvisionedThroughputExceededException)
+                    DynamoDB --> Processor: ERROR: Throttling
+
+                    Processor -> Processor: Retry with exponential backoff (max 3 attempts)
+                    note right #RETRY_COLOR
+                    **Retry Strategy**:
+                    - Jitter: Random 0-100ms
+                    - Backoff: 100ms, 200ms, 400ms
+                    - Circuit breaker: Open after 10 failures/min
+                    end note
+
+                    alt Retry Successful
+                        DynamoDB --> Processor: Write successful
+                    else All Retries Failed
+                        Processor -> DLQ: Send to Dead Letter Queue
+                        Processor -> CloudWatch: ALERT: DynamoDB persistent failure
+                        Processor -> SNS: Page on-call engineer
+                        note right #FAILURE_COLOR
+                        **Impact**: Telemetry data loss
+                        **Severity**: MEDIUM
+                        **MTTR**: 15 minutes (auto-scaling trigger)
+                        **Mitigation**: Increase WCU provisioned capacity
+                        end note
+                    end
+
+                else #FAILURE_COLOR Connection Pool Exhausted
+                    DynamoDB --> Processor: ERROR: Cannot acquire connection
+
+                    Processor -> CloudWatch: CRITICAL: Connection pool exhausted
+                    note right #FAILURE_COLOR
+                    **Root Cause**: Lambda concurrency spike
+                    **Impact**: All telemetry writes blocked
+                    **Severity**: HIGH
+                    **Detection**: CloudWatch alarm on connection errors
+                    **Mitigation**: Increase max connections in pool
+                    end note
+
+                    Processor -> DLQ: Send to DLQ for retry
+                    Processor -> SNS: CRITICAL: Database connection failure
+                end
+                deactivate DynamoDB
+
+            and
+                Processor -> Timestream: Write time-series data
+                activate Timestream
+
+                alt #SUCCESS_COLOR Timestream Write Success
+                    Timestream --> Processor: Write successful (RecordsIngested: 1)
+                    note right #SUCCESS_COLOR
+                    **Time-Series Optimization**:
+                    - Magnetic store: 24 hours
+                    - Memory store: 90 days
+                    - Partition: vehicle_id + time
+                    - Compression: ~95% for telemetry
+                    end note
+
+                else #FAILURE_COLOR Timestream RejectedRecordsException
+                    Timestream --> Processor: ERROR: Record rejected (out-of-order timestamp)
+
+                    Processor -> CloudWatch: WARN: Out-of-order telemetry
+                    note right #WARNING_COLOR
+                    **Cause**: Clock skew or network delay
+                    **Impact**: Time-series integrity compromised
+                    **Severity**: LOW
+                    **Mitigation**: Vehicle NTP sync required
+                    end note
+
+                    Processor -> DLQ: Store rejected record for manual review
+                end
+                deactivate Timestream
+            end
+
+            Processor -> CloudWatch: Publish processing metrics
+            note right
+            **Metrics**:
+            - telemetry.processing.latency (P50, P99, P99.9)
+            - telemetry.processing.success_rate
+            - telemetry.data_volume_bytes
+            end note
+
+            Processor --> Validator: Processing complete
+            deactivate Processor
+
+        else #WARNING_COLOR Duplicate Message ID Detected
+            DynamoDB --> Validator: Duplicate found (timestamp of original)
+
+            Validator -> CloudWatch: Increment duplicate counter
+            note right #WARNING_COLOR
+            **Deduplication Window**: 5 minutes
+            **Cause**: QoS 1 retry or network replay
+            **Impact**: Idempotency maintained, no data corruption
+            **Severity**: INFO
+            **Expected Rate**: <0.1% of messages
+            end note
+
+            Validator -> Validator: Discard duplicate silently
+        end
+        deactivate DynamoDB
+
+    else #FAILURE_COLOR Protobuf Parsing Failed
+        Validator -> CloudWatch: ERROR: Invalid protobuf payload
+        Validator -> DLQ: Send raw message to DLQ
+        note right #FAILURE_COLOR
+        **Parsing Failures**:
+        - Schema version mismatch
+        - Corrupted payload
+        - Wrong content-type
+
+        **Recovery**: Manual inspection required
+        **Severity**: MEDIUM
+        **Alert**: Page engineering if rate > 1%
+        end note
+
+        Validator -> SNS: ALERT: Protobuf parsing failure for {vehicle_id}
+
+    else #FAILURE_COLOR Validation Failed (Data Range)
+        Validator -> CloudWatch: WARN: Validation error (invalid data range)
+        note right #WARNING_COLOR
+        **Common Validation Errors**:
+        - Speed > 300 km/h (sensor error)
+        - Negative fuel level
+        - Timestamp in future
+        - Missing required fields
+
+        **Severity**: LOW
+        **Action**: Flag vehicle for diagnostics
+        end note
+
+        Validator -> DLQ: Send for manual review and vehicle diagnostics
+    end
+
+    deactivate Validator
+    deactivate Rules
+
+else #FAILURE_COLOR Message Too Large (>128KB)
+    IoTCore --> MQTTClient: PUBACK (Reason Code: 0x95 - Packet Too Large)
+
+    MQTTClient -> CloudWatch: ERROR: Message size exceeded
+    note right #FAILURE_COLOR
+    **Root Cause**: Batch telemetry sent to individual topic
+    **Impact**: Message rejected
+    **Severity**: MEDIUM
+    **Mitigation**: Client-side validation before publish
+    end note
+
+    MQTTClient -> MQTTClient: Split message or switch to batch topic
+
+else #FAILURE_COLOR Unauthorized Topic (IAM Policy Violation)
+    IoTCore --> MQTTClient: PUBACK (Reason Code: 0x87 - Not Authorized)
+
+    IoTCore -> CloudWatch: WARN: Authorization failure
+    note right #WARNING_COLOR
+    **Security Event**: Vehicle attempting to publish to another vehicle's topic
+    **Impact**: Message blocked
+    **Severity**: HIGH (potential security breach)
+    **Action**: Investigate device certificate
+    end note
+
+    IoTCore -> SNS: SECURITY ALERT: Unauthorized publish attempt by {vehicle_id}
+
+else #FAILURE_COLOR Network Failure (No PUBACK Received)
+    MQTTClient -> MQTTClient: Wait for PUBACK timeout (5 seconds)
+
+    alt #RETRY_COLOR Timeout Expired, Retry QoS 1 Message
+        note right #RETRY_COLOR
+        **QoS 1 Retry Behavior**:
+        - Client retains message until PUBACK received
+        - Retry with DUP flag set
+        - Max retries: 3
+        - Exponential backoff: 5s, 10s, 20s
+        end note
+
+        MQTTClient -> IoTCore: PUBLISH (DUP=true, same Packet ID)
+
+        alt PUBACK Received
+            IoTCore --> MQTTClient: PUBACK
+        else Max Retries Exceeded
+            MQTTClient -> MQTTClient: Store in local persistent queue
+            MQTTClient -> CloudWatch: ERROR: Failed to deliver telemetry
+            note right #FAILURE_COLOR
+            **Local Storage**:
+            - Max queue size: 1000 messages
+            - Storage: Flash memory
+            - Retry: On next successful connection
+            - Overflow behavior: Drop oldest messages
+            end note
+        end
+    end
+end
+
+deactivate IoTCore
+deactivate MQTTClient
+
+== Phase 2B: Batched Telemetry Publishing (Optimized for Bandwidth) ==
+
+note over ECU, CloudWatch
+**Frequency**: Every 60 minutes (off-peak hours)
+**Topic**: v2c/v1/{region}/{vehicle_id}/telemetry/batch
+**Payload**: 25-50 messages compressed with ZSTD
+**Compression**: 60-80% size reduction
+**Cost Savings**: $2.73M annually for 1M vehicles
+end note
+
+ECU -> MQTTClient: Send batch of 25-50 telemetry messages
+activate MQTTClient
+
+MQTTClient -> MQTTClient: Aggregate telemetry from local buffer
+MQTTClient -> MQTTClient: Serialize to Protocol Buffers (TelemetryBatch)
+MQTTClient -> MQTTClient: Compress with ZSTD (level 3)
+
+note right
+**Batch Optimization**:
+- Uncompressed: 25 msgs × 400 bytes = 10KB
+- Compressed: ~2-4KB (60-80% reduction)
+- MQTT overhead: 54 bytes → 2 bytes (topic alias)
+- Total savings: 96% overhead + 70% payload
+end note
+
+MQTTClient -> MQTTClient: Generate batch_id (UUID v4)
+MQTTClient -> MQTTClient: Set compression_type=ZSTD in metadata
+
+MQTTClient -> IoTCore: PUBLISH (Topic=batch, Topic Alias=2, QoS=1, Payload=compressed batch)
+activate IoTCore
+
+alt #SUCCESS_COLOR Batch Message Valid
+    IoTCore --> MQTTClient: PUBACK
+    IoTCore -> Rules: Trigger batch processing rule
+    activate Rules
+
+    Rules -> Validator: Invoke batch validator Lambda
+    activate Validator
+
+    Validator -> Validator: Decompress ZSTD payload
+
+    alt #SUCCESS_COLOR Decompression Success
+        Validator -> Validator: Parse TelemetryBatch protobuf
+        Validator -> Validator: Verify batch_id, message_count, checksums
+
+        loop For each message in batch (25-50 messages)
+            Validator -> Validator: Validate individual telemetry message
+
+            alt Message Valid
+                Validator -> DynamoDB: Check for duplicate message_id
+                activate DynamoDB
+
+                alt Not Duplicate
+                    Validator -> Processor: Forward to processor
+                    activate Processor
+
+                    par Batch Writes (Performance Optimized)
+                        Processor -> DynamoDB: BatchWriteItem (up to 25 items)
+                        note right
+                        **Batch Write Optimization**:
+                        - Single API call for 25 records
+                        - Reduced WCU consumption
+                        - Latency amortized across batch
+                        end note
+
+                        alt #SUCCESS_COLOR Batch Write Success
+                            DynamoDB --> Processor: All items written
+                        else #FAILURE_COLOR Partial Batch Failure
+                            DynamoDB --> Processor: UnprocessedItems returned
+                            Processor -> Processor: Retry unprocessed items (exponential backoff)
+
+                            alt Retry Success
+                                DynamoDB --> Processor: Success
+                            else Retry Failed
+                                Processor -> DLQ: Send unprocessed items to DLQ
+                                Processor -> CloudWatch: ALERT: Partial batch write failure
+                            end
+                        end
+                    and
+                        Processor -> Timestream: WriteRecords (batch insert)
+                        alt #SUCCESS_COLOR Timestream Batch Success
+                            Timestream --> Processor: All records ingested
+                        else #FAILURE_COLOR Some Records Rejected
+                            Timestream --> Processor: RejectedRecords list
+                            Processor -> DLQ: Store rejected records
+                            Processor -> CloudWatch: WARN: Time-series batch partial failure
+                        end
+                    end
+
+                    deactivate Processor
+                else Duplicate
+                    Validator -> CloudWatch: Increment batch duplicate counter
+                end
+                deactivate DynamoDB
+            else Message Invalid
+                Validator -> CloudWatch: WARN: Invalid message in batch
+                Validator -> DLQ: Store invalid message with batch context
+            end
+        end
+
+        Validator -> CloudWatch: Publish batch processing metrics
+        note right
+        **Batch Metrics**:
+        - batch.size (message count)
+        - batch.compression_ratio
+        - batch.processing_duration
+        - batch.success_rate
+        - batch.duplicate_rate
+        end note
+
+    else #FAILURE_COLOR Decompression Failed
+        Validator -> CloudWatch: ERROR: ZSTD decompression failure
+        Validator -> DLQ: Send raw compressed batch for investigation
+        Validator -> SNS: ALERT: Batch decompression error for {vehicle_id}
+
+        note right #FAILURE_COLOR
+        **Decompression Failures**:
+        - Corrupted payload during transmission
+        - Wrong compression algorithm specified
+        - Lambda memory exhausted (payload too large)
+
+        **Severity**: HIGH
+        **Impact**: Entire batch lost (25-50 messages)
+        **Recovery**: Vehicle will resend on next batch cycle
+        end note
+    end
+
+    deactivate Validator
+    deactivate Rules
+
+else #FAILURE_COLOR Batch Exceeds Maximum Size
+    IoTCore --> MQTTClient: PUBACK (Reason Code: 0x95 - Packet Too Large)
+
+    MQTTClient -> MQTTClient: Split batch into smaller chunks (12-13 messages each)
+    note right #WARNING_COLOR
+    **Batch Size Management**:
+    - Max MQTT payload: 128KB
+    - Typical batch: 2-4KB compressed
+    - Safety margin: Send max 50 messages
+    - If exceeded: Split and retry
+    end note
+
+    MQTTClient -> IoTCore: Retry with smaller batches
+end
+
+deactivate IoTCore
+deactivate MQTTClient
+
+== Phase 3: Monitoring and Alerting ==
+
+CloudWatch -> CloudWatch: Aggregate metrics every 60 seconds
+
+alt #FAILURE_COLOR Error Rate > 1%
+    CloudWatch -> SNS: Trigger alarm: High telemetry error rate
+    SNS -> SNS: Send to PagerDuty / Slack / Email
+    note right #FAILURE_COLOR
+    **Alert Configuration**:
+    - Threshold: 1% error rate
+    - Evaluation periods: 3 consecutive
+    - Datapoints to alarm: 2 of 3
+    - Action: Page on-call engineer
+    end note
+
+else #WARNING_COLOR Latency P99 > 2000ms
+    CloudWatch -> SNS: Trigger alarm: High telemetry latency
+    note right #WARNING_COLOR
+    **Performance Degradation**:
+    - SLA: P99 < 1000ms
+    - Current: P99 > 2000ms
+    - Impact: User-facing features delayed
+    - Action: Scale up Lambda / DynamoDB
+    end note
+
+else #FAILURE_COLOR DLQ Message Count > 100
+    CloudWatch -> SNS: Trigger alarm: Dead letter queue buildup
+    note right #FAILURE_COLOR
+    **DLQ Alerts**:
+    - Threshold: 100 messages
+    - Retention: 14 days
+    - Action: Manual review and replay
+    - Typical causes: Schema changes, validation logic bugs
+    end note
+
+else #SUCCESS_COLOR Duplicate Rate > 5%
+    CloudWatch -> SNS: Trigger info notification: High duplicate rate
+    note right #WARNING_COLOR
+    **Duplicate Detection**:
+    - Expected: <0.1% (QoS 1 retries)
+    - Current: >5% (abnormal)
+    - Potential cause: Network instability, client bug
+    - Action: Investigate vehicle connectivity
+    end note
+
+else #FAILURE_COLOR Lambda Throttling Detected
+    CloudWatch -> CloudWatch: Check concurrent execution limit
+    note right #FAILURE_COLOR
+    **Lambda Throttling**:
+    - Account limit: 1000 concurrent executions
+    - Current: Approaching limit
+    - Impact: Telemetry processing delayed
+    - Action: Request limit increase or optimize concurrency
+    end note
+
+    CloudWatch -> SNS: CRITICAL: Lambda throttling, increase concurrency limit
+end
+
+== Phase 4: Manual Recovery Procedures ==
+
+actor "DevOps Engineer" as Engineer
+
+alt DLQ Messages Require Replay
+    Engineer -> DLQ: Query failed messages (filter by error type)
+    Engineer -> DLQ: Analyze root cause (schema issue, data corruption, etc.)
+
+    alt Root Cause Fixed
+        Engineer -> Processor: Replay DLQ messages via reprocessing pipeline
+        note right
+        **Replay Pipeline**:
+        - Read from S3 DLQ bucket
+        - Apply fixes (schema migration, data transformation)
+        - Resubmit to processing Lambda
+        - Verify success in DynamoDB/Timestream
+        end note
+
+        Processor -> DynamoDB: Write replayed data
+        Processor -> Timestream: Write replayed time-series
+        Engineer -> DLQ: Purge successfully replayed messages
+    else Root Cause Not Fixed
+        Engineer -> Engineer: Document issue for engineering team
+        Engineer -> SNS: Escalate to engineering for permanent fix
+    end
+end
+
+alt Circuit Breaker Open
+    Engineer -> CloudWatch: Review circuit breaker metrics
+    Engineer -> Processor: Reset circuit breaker manually (if safe)
+    note right
+    **Circuit Breaker Reset Criteria**:
+    - Downstream dependency healthy (DynamoDB/Timestream)
+    - Error rate back to normal (<0.1%)
+    - Manual validation of recent messages
+    end note
+
+    Processor -> Processor: Half-open state (test with 10% traffic)
+
+    alt Test Traffic Successful
+        Processor -> Processor: Close circuit breaker (resume full traffic)
+        CloudWatch -> CloudWatch: Monitor for recurrence
+    else Test Traffic Failed
+        Processor -> Processor: Re-open circuit breaker
+        Engineer -> SNS: Escalate: Persistent downstream failure
+    end
+end
+
+alt Cache Invalidation Required (Data Inconsistency)
+    Engineer -> DynamoDB: Verify data integrity (checksums, record counts)
+
+    alt Data Inconsistency Detected
+        Engineer -> DynamoDB: Identify affected records (by timestamp range)
+        Engineer -> DLQ: Replay affected time period from DLQ or vehicle re-transmission
+        Engineer -> CloudWatch: Document incident and resolution
+    end
+end
+
+== FMEA Summary Annotations ==
+
+note over ECU, CloudWatch
+**Critical Failure Modes Covered**:
+
+1. **Certificate Expiry** (Severity: HIGH, Probability: LOW)
+   - Detection: 7-day warning monitoring
+   - Impact: Vehicle offline, remote features unavailable
+   - Mitigation: Auto-renewal, SMS fallback
+
+2. **Network Timeout** (Severity: MEDIUM, Probability: MEDIUM)
+   - Detection: MQTT keep-alive, connection retry failures
+   - Impact: Delayed telemetry, local buffering required
+   - Mitigation: Exponential backoff, local storage (1000 msgs)
+
+3. **DynamoDB Throttling** (Severity: MEDIUM, Probability: LOW)
+   - Detection: ProvisionedThroughputExceededException
+   - Impact: Telemetry write failures, DLQ buildup
+   - Mitigation: Auto-scaling, retry with backoff, circuit breaker
+
+4. **Protobuf Parsing Failure** (Severity: MEDIUM, Probability: LOW)
+   - Detection: Lambda parsing exceptions
+   - Impact: Message rejected, DLQ storage
+   - Mitigation: Schema versioning, backward compatibility
+
+5. **Duplicate Messages** (Severity: LOW, Probability: MEDIUM)
+   - Detection: DynamoDB deduplication lookup
+   - Impact: None (idempotent design)
+   - Mitigation: 5-minute deduplication window
+
+6. **Lambda Timeout** (Severity: MEDIUM, Probability: LOW)
+   - Detection: CloudWatch timeout metric
+   - Impact: Message processing incomplete
+   - Mitigation: DLQ storage, increase timeout/memory
+
+7. **Connection Pool Exhaustion** (Severity: HIGH, Probability: LOW)
+   - Detection: Connection acquisition errors
+   - Impact: All database writes blocked
+   - Mitigation: Increase pool size, Lambda concurrency limits
+
+8. **Time-Series Out-of-Order** (Severity: LOW, Probability: MEDIUM)
+   - Detection: Timestream RejectedRecords
+   - Impact: Time-series integrity issues
+   - Mitigation: Vehicle NTP sync, DLQ for review
+
+**Performance Characteristics**:
+- **Latency**: P50 < 100ms, P99 < 500ms, P99.9 < 2000ms
+- **Throughput**: 10,000 messages/sec per region
+- **Availability**: 99.95% (8.76 hrs downtime/year)
+- **Durability**: 99.999999999% (11 nines) via S3 DLQ
+
+**Cost Optimization**:
+- Topic aliases: 96% MQTT overhead reduction
+- ZSTD compression: 60-80% payload reduction
+- Batch processing: 70% reduced Lambda invocations
+- Annual savings (1M vehicles): $2.73M
+
+**Security Measures**:
+- mTLS: X.509 certificate authentication
+- IAM policies: Topic-level authorization
+- Encryption: TLS 1.3 in transit, AES-256 at rest
+- Audit logging: CloudTrail for all API calls
+- Monitoring: Real-time security alerts via SNS
+
+end note
+
+@enduml
