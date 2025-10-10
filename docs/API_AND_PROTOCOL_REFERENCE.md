@@ -1357,6 +1357,30 @@ Vehicle acknowledges cancellation request.
 
 **Package:** `com.vehicle.v2c.commands.v1`
 
+#### Message Orchestration Sequence Diagram
+
+The following sequence diagram shows the complete message orchestration from backend (cloud) through the vehicle, including all error scenarios and recovery mechanisms per FMEA requirements.
+
+**Note:** For the complete FMEA-ready sequence diagram with all error scenarios, recovery mechanisms, and failure annotations, please refer to the standalone file: `docs/sequence-diagrams/02-command-flow.puml`
+
+The diagram covers:
+- **Phase 1**: Authentication and Authorization (JWT validation, role checks)
+- **Phase 2**: Rate Limiting and Duplicate Detection (idempotency)
+- **Phase 3**: MQTT Publishing (QoS 1-2, retry mechanisms)
+- **Phase 4**: Vehicle-side Validation (precondition checks, safety constraints)
+- **Phase 5**: Command Execution (CAN bus communication, actuator control)
+- **Phase 6**: Cloud Response Processing (status updates, notifications)
+- **Phase 7**: Timeout Handling (background jobs, expiry management)
+- **Phase 8**: Cancellation Flow (user-initiated, cleanup procedures)
+- **FMEA Annotations**: All failure modes with RPN calculations, severity ratings, and mitigation strategies
+
+**Rendering Instructions:**
+- **VS Code**: Install PlantUML extension, press Alt+D (Windows/Linux) or Option+D (Mac) on the `.puml` file
+- **CLI**: `plantuml -tsvg docs/sequence-diagrams/02-command-flow.puml` (requires [PlantUML](https://plantuml.com/) installed)
+- **Online**: Visit [PlantUML Web Server](http://www.plantuml.com/plantuml/uml/) and paste the code from the file
+
+---
+
 #### Overview
 
 The remote command protocol enables cloud-to-vehicle actionable commands with comprehensive safety checks and execution tracking.
@@ -1601,6 +1625,34 @@ Defines retry behavior for failed operations.
 
 **Package:** `com.vehicle.v2c.diagnostics.v1`
 
+#### Message Orchestration Sequence Diagram
+
+The following sequence diagram shows the complete diagnostic message flow from vehicle ECU through cloud processing, ML inference, and customer notifications, including all error scenarios and recovery mechanisms per FMEA requirements.
+
+**Note:** For the complete FMEA-ready sequence diagram with all error scenarios, recovery mechanisms, and failure annotations, please refer to the standalone file: `docs/sequence-diagrams/04-diagnostics-flow.puml`
+
+The diagram covers:
+- **DTC Detection Phase**: On-board diagnostics, OBD-II monitoring, freeze frame capture
+- **DTC Reporting**: CAN bus communication, diagnostic agent processing
+- **Duplicate Suppression**: Idempotency cache, smart deduplication (80% bandwidth savings)
+- **MQTT Publishing**: QoS 1 delivery, connection recovery, persistent sessions
+- **Cloud Processing**: Lambda DTC processor, protobuf deserialization, validation
+- **DTC History Storage**: DynamoDB writes with retry logic, throttling handling
+- **Historical Analysis**: Pattern correlation, recurring DTC detection
+- **Predictive Maintenance**: ML model inference (SageMaker), failure probability predictions
+- **Service Recommendations**: Business rules engine, dealer matching, cost estimation
+- **Severity-Based Routing**: Critical towing dispatch, high-priority alerts, normal notifications
+- **Warranty Integration**: Real-time coverage validation, claim pre-approval
+- **Multi-Channel Notifications**: Push (FCM), Email (SES), SMS (SNS) with fallback strategies
+- **FMEA Annotations**: All failure modes with RPN calculations, severity ratings, and mitigation strategies
+
+**Rendering Instructions:**
+- **VS Code**: Install PlantUML extension, press Alt+D (Windows/Linux) or Option+D (Mac) on the `.puml` file
+- **CLI**: `plantuml -tsvg docs/sequence-diagrams/04-diagnostics-flow.puml` (requires [PlantUML](https://plantuml.com/) installed)
+- **Online**: Visit [PlantUML Web Server](http://www.plantuml.com/plantuml/uml/) and paste the code from the file
+
+---
+
 #### Overview
 
 The diagnostics protocol enables comprehensive vehicle diagnostic data collection including DTCs, ECU health, system snapshots, and logs.
@@ -1716,6 +1768,38 @@ Complete vehicle state capture.
 
 **Package:** `com.vehicle.v2c.ota.v1`
 
+#### Message Orchestration Sequence Diagram
+
+The following sequence diagram shows the complete OTA update lifecycle from campaign creation through installation, verification, and rollback, including all error scenarios and recovery mechanisms per FMEA requirements.
+
+**Note:** For the complete FMEA-ready sequence diagram with all error scenarios, recovery mechanisms, and failure annotations, please refer to the standalone file: `docs/sequence-diagrams/03-ota-update-flow.puml`
+
+The diagram covers:
+- **Phase 1: Update Notification**: Campaign creation, HSM signing, presigned S3 URLs, MQTT QoS 2 delivery
+- **Phase 2: Update Acceptance and Download**:
+  - Signature verification (HSM/TPM)
+  - Precondition checks (battery, storage, vehicle state)
+  - HTTP range requests with resume support
+  - Network interruption recovery
+  - Checksum validation (SHA-256)
+- **Phase 3: Installation and Verification**:
+  - A/B partition strategy
+  - Pre-install checks (DTCs, CAN bus health)
+  - Flash memory writes
+  - Bootloader updates
+  - Automatic rollback on boot failure (watchdog, 3-attempt limit)
+  - Post-install verification tests
+- **Canary Deployment**: Phased rollout (100 vehicles → full fleet), success rate validation
+- **Emergency Fleet-Wide Rollback**: Critical bug response, mass rollback procedures
+- **FMEA Annotations**: All failure modes with RPN calculations, severity ratings, and mitigation strategies
+
+**Rendering Instructions:**
+- **VS Code**: Install PlantUML extension, press Alt+D (Windows/Linux) or Option+D (Mac) on the `.puml` file
+- **CLI**: `plantuml -tsvg docs/sequence-diagrams/03-ota-update-flow.puml` (requires [PlantUML](https://plantuml.com/) installed)
+- **Online**: Visit [PlantUML Web Server](http://www.plantuml.com/plantuml/uml/) and paste the code from the file
+
+---
+
 #### Overview
 
 The OTA (Over-The-Air) update protocol manages secure firmware and software updates for vehicle systems.
@@ -1811,6 +1895,45 @@ Vehicle reports download progress.
 ### Telemetry Messages
 
 **Package:** `com.vehicle.v2c.telemetry.v1` and `com.vehicle.v2c.telemetrybatch.v1`
+
+#### Message Orchestration Sequence Diagram
+
+The following sequence diagram shows the complete telemetry flow from vehicle ECU through MQTT broker to cloud storage and processing, including all error scenarios and recovery mechanisms per FMEA requirements.
+
+**Note:** For the complete FMEA-ready sequence diagram with all error scenarios, recovery mechanisms, and failure annotations, please refer to the standalone file: `docs/sequence-diagrams/01-telemetry-flow.puml`
+
+The diagram covers:
+- **Phase 1: Connection Establishment**: Cold start, mTLS certificate validation, MQTT 5.0 connection, subscription setup
+- **Phase 2A: Individual Telemetry Publishing**:
+  - Real-time sensor data collection (1-10 min frequency)
+  - Protocol Buffers serialization
+  - Topic alias optimization (96% overhead reduction, $2.73M annual savings)
+  - QoS 1 delivery with PUBACK
+  - IoT Rules Engine processing
+  - Lambda validation and processing
+  - Duplicate detection (deduplication window)
+  - Parallel writes (DynamoDB + Timestream)
+- **Phase 2B: Batched Telemetry Publishing**:
+  - Aggregation (25-50 messages)
+  - ZSTD compression (60-80% reduction)
+  - Batch processing with retry logic
+  - Performance optimization (batch writes)
+- **Phase 3: Monitoring and Alerting**: Real-time metrics, error rate monitoring, latency tracking, DLQ management
+- **Phase 4: Manual Recovery**: DLQ replay, circuit breaker reset, cache invalidation
+- **FMEA Annotations**: All failure modes with RPN calculations, severity ratings, and mitigation strategies
+
+**Key Performance Metrics:**
+- Latency: P50 < 100ms, P99 < 500ms, P99.9 < 2000ms
+- Throughput: 10,000 messages/sec per region
+- Availability: 99.95% (8.76 hrs downtime/year)
+- Cost Savings: Topic aliases + compression = 96% reduction
+
+**Rendering Instructions:**
+- **VS Code**: Install PlantUML extension, press Alt+D (Windows/Linux) or Option+D (Mac) on the `.puml` file
+- **CLI**: `plantuml -tsvg docs/sequence-diagrams/01-telemetry-flow.puml` (requires [PlantUML](https://plantuml.com/) installed)
+- **Online**: Visit [PlantUML Web Server](http://www.plantuml.com/plantuml/uml/) and paste the code from the file
+
+---
 
 #### Overview
 
