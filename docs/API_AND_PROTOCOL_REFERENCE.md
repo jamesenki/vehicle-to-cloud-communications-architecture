@@ -1387,6 +1387,11 @@ sequenceDiagram
 
 This shows the complete request/response flow for remote commands. The vehicle validates safety preconditions before execution and sends status updates back through MQTT.
 
+**Detailed FMEA-Ready Diagram:**
+
+![Remote Command Flow](sequence-diagrams/02-command-flow.png)
+*Complete command execution flow with error handling and recovery mechanisms*
+
 **Note:** For the complete FMEA-ready sequence diagram with all error scenarios, recovery mechanisms, and failure annotations, please refer to: `docs/sequence-diagrams/02-command-flow.puml`
 
 ---
@@ -1681,6 +1686,19 @@ sequenceDiagram
 
 This shows DTC detection at the ECU level, intelligent deduplication, ML-based predictive maintenance analysis, and severity-based customer notification routing with warranty integration.
 
+**Detailed FMEA-Ready Diagrams:**
+
+![DTC Detection](sequence-diagrams/04a-dtc-detection.png)
+*Phase 1: DTC Detection and Reporting*
+
+![ML Analysis](sequence-diagrams/04b-ml-analysis.png)
+*Phase 2: Predictive Maintenance ML Analysis*
+
+![Customer Notification](sequence-diagrams/04c-customer-notification.png)
+*Phase 3: Severity-Based Customer Notification*
+
+For complete failure mode analysis, see the PlantUML source files in `docs/sequence-diagrams/`
+
 **Note:** For the complete FMEA-ready sequence diagram with all error scenarios, recovery mechanisms, warranty validation, multi-channel notifications, and failure annotations, please refer to: `docs/sequence-diagrams/04-diagnostics-flow.puml`
 
 ---
@@ -1845,6 +1863,19 @@ sequenceDiagram
 
 This shows the complete OTA lifecycle with three distinct phases: notification with precondition checking, secure download with progress tracking, and installation with automatic rollback protection.
 
+**Detailed FMEA-Ready Diagrams:**
+
+![OTA Notification](sequence-diagrams/03a-ota-notification.png)
+*Phase 1: Update Notification and Acceptance*
+
+![OTA Download](sequence-diagrams/03b-ota-download.png)
+*Phase 2: Secure Download with Progress Tracking*
+
+![OTA Installation](sequence-diagrams/03c-ota-installation.png)
+*Phase 3: Installation with Rollback Protection*
+
+For complete failure mode analysis, see the PlantUML source files in `docs/sequence-diagrams/`
+
 **Note:** For the complete FMEA-ready sequence diagram with all error scenarios, recovery mechanisms, canary deployment, emergency rollback, and failure annotations, please refer to: `docs/sequence-diagrams/03-ota-update-flow.puml`
 
 ---
@@ -1973,6 +2004,19 @@ sequenceDiagram
 ```
 
 This shows the primary telemetry publishing flow with real-time sensor data collection, Protocol Buffers serialization, and parallel storage to DynamoDB and Timestream. Topic aliases provide 96% bandwidth savings.
+
+**Detailed FMEA-Ready Diagrams:**
+
+![Telemetry Connection](sequence-diagrams/01a-telemetry-connection.png)
+*Phase 1: Connection Establishment and Session Management*
+
+![Telemetry Publishing](sequence-diagrams/01b-telemetry-publishing.png)
+*Phase 2: Individual Message Publishing with Error Handling*
+
+![Telemetry Batch](sequence-diagrams/01c-telemetry-batch.png)
+*Phase 3: Batch Processing for Bandwidth Optimization*
+
+For complete failure mode analysis, see the PlantUML source files in `docs/sequence-diagrams/`
 
 **Note:** For the complete FMEA-ready sequence diagram with all error scenarios, recovery mechanisms, batching optimization, and failure annotations, please refer to: `docs/sequence-diagrams/01-telemetry-flow.puml`
 
