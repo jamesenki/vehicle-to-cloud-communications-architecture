@@ -22,7 +22,7 @@ The intention of this project is to produce a prescriptive specification for the
 
 ## Scope
 Documentation of recommended basic practices for MQTT V5 based vehicle to cloud communication patterns. 
-* Message format and orchestration for the most common vehicle telemetry and command based use patterns. [See Documentation Here](https://github.com/jamesenki/AGLV2C/blob/3dcf4fcee2a7bcef8e7f2af6473dfb90b810aa05/src/main/doc/%20v2c.md)
+* Message format and orchestration for the most common vehicle telemetry and command based use patterns. [See Documentation Here](src/main/doc/v2c.md)
 * Gradle Build configuration for building both documentation and Java (and other?) stubs from protocol buffer files.
 * Example message implementations for reference. 
 * Middleware API set for translation from ISO Standards to VSS
@@ -47,7 +47,7 @@ The AGL Vehicle to Cloud Communications Project defines standard data communicat
 
 This project includes: 
 * Documentation of recommended basic practices for MQTT V5 based vehicle to cloud communication patterns. 
-* Message format and orchestration for the most common vehicle telemetry and command based use patterns. [See Documentation Here](https://github.com/jamesenki/AGLV2C/blob/3dcf4fcee2a7bcef8e7f2af6473dfb90b810aa05/src/main/doc/%20v2c.md)
+* Message format and orchestration for the most common vehicle telemetry and command based use patterns. [See Documentation Here](src/main/doc/v2c.md)
 * Gradle Build configuration for building both documentation and Java (and other?) stubs from protocol buffer files.
 * Example message implementations for reference. 
 
