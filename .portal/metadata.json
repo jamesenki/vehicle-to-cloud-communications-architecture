@@ -16,11 +16,9 @@
     "remote-diagnostics",
     "vss-integration"
   ],
-
   "marketing": {
     "headline": "Production-Ready MQTT 5.0 Platform for Connected Vehicle Communication",
     "subheadline": "Industry-leading 95% FMEA compliance with comprehensive Protocol Buffer specifications - 82% production-ready for immediate deployment",
-
     "keyBenefits": [
       {
         "title": "96% Bandwidth Optimization Through Intelligent Batching",
@@ -39,7 +37,6 @@
         "description": "Pre-built Protocol Buffer specifications, MQTT topic standards, AsyncAPI documentation, and reference implementations enable rapid integration with existing telematics units and cloud platforms"
       }
     ],
-
     "useCases": [
       {
         "industry": "Connected Vehicle OEMs",
@@ -63,15 +60,34 @@
       }
     ]
   },
-
   "technical": {
     "architecture": "Event-driven MQTT 5.0 architecture with Protocol Buffers, VSS integration, and multi-cloud support",
     "core": {
-      "protocols": ["MQTT 5.0", "Protocol Buffers", "AsyncAPI 2.0"],
-      "standards": ["VSS (Vehicle Signal Specification)", "ISO 21434", "OASIS MQTT v5.0"],
-      "security": ["mTLS", "X.509 Certificates", "PKI", "TARA"],
-      "buildSystem": ["Gradle", "Protocol Buffer Compiler"],
-      "cloudPlatforms": ["AWS", "Azure", "GCP"]
+      "protocols": [
+        "MQTT 5.0",
+        "Protocol Buffers",
+        "AsyncAPI 2.0"
+      ],
+      "standards": [
+        "VSS (Vehicle Signal Specification)",
+        "ISO 21434",
+        "OASIS MQTT v5.0"
+      ],
+      "security": [
+        "mTLS",
+        "X.509 Certificates",
+        "PKI",
+        "TARA"
+      ],
+      "buildSystem": [
+        "Gradle",
+        "Protocol Buffer Compiler"
+      ],
+      "cloudPlatforms": [
+        "AWS",
+        "Azure",
+        "GCP"
+      ]
     },
     "messagePatterns": [
       "Vehicle and device provisioning",
@@ -101,7 +117,10 @@
     "security": {
       "authentication": "mTLS with X.509 certificates",
       "encryption": "TLS 1.3",
-      "compliance": ["ISO 21434 TARA", "PII Data Governance"],
+      "compliance": [
+        "ISO 21434 TARA",
+        "PII Data Governance"
+      ],
       "features": [
         "Certificate lifecycle management",
         "Audit logging",
@@ -119,7 +138,6 @@
       "standards": "/docs/standards/"
     }
   },
-
   "productionReadiness": {
     "overallScore": "82%",
     "timeline": "2-4 months with dedicated team",
@@ -138,15 +156,27 @@
       "VSS middleware completion"
     ]
   },
-
   "integration": {
-    "protocols": ["MQTT 5.0", "HTTPS", "WebSocket"],
-    "formats": ["Protocol Buffers", "JSON", "AsyncAPI"],
-    "authentication": ["mTLS", "X.509 Certificates"],
-    "sdks": ["Java (via Gradle)", "Planned: C, Rust, Python"],
+    "protocols": [
+      "MQTT 5.0",
+      "HTTPS",
+      "WebSocket"
+    ],
+    "formats": [
+      "Protocol Buffers",
+      "JSON",
+      "AsyncAPI"
+    ],
+    "authentication": [
+      "mTLS",
+      "X.509 Certificates"
+    ],
+    "sdks": [
+      "Java (via Gradle)",
+      "Planned: C, Rust, Python"
+    ],
     "codeGeneration": "Gradle-based Protocol Buffer compilation"
   },
-
   "roadmap": [
     {
       "milestone": "Reference Implementations",
@@ -169,12 +199,39 @@
       "priority": "Medium"
     }
   ],
-
   "compliance": [
     "ISO 21434 (Automotive Cybersecurity)",
     "OASIS MQTT v5.0",
     "Vehicle Signal Specification (VSS)",
     "GDPR (PII Data Governance)",
     "FMEA Standards (95% compliance)"
-  ]
+  ],
+  "resources": {
+    "workshopPresentations": [
+      {
+        "title": "Microservices & API Design",
+        "url": "https://gamma.app/docs/jfwllxz1pr8cowl"
+      },
+      {
+        "title": "Cloud-Native Architecture",
+        "url": "https://gamma.app/docs/7mvehp2pwaxcf4c"
+      },
+      {
+        "title": "Event Streaming & Real-Time Systems",
+        "url": "https://gamma.app/docs/77lmhglwfo447w1"
+      },
+      {
+        "title": "Observability & Site Reliability Engineering",
+        "url": "https://gamma.app/docs/766e5bnuyyb06x0"
+      },
+      {
+        "title": "Security & Compliance for Connected Vehicles",
+        "url": "https://gamma.app/docs/anwlx3yqfa5vmno"
+      },
+      {
+        "title": "Performance Engineering & Optimization",
+        "url": "https://gamma.app/docs/g5btvv7znkfhq8r"
+      }
+    ]
+  }
 }
